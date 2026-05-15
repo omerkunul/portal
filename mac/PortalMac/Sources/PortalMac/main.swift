@@ -637,7 +637,7 @@ final class MotionGraphView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.controlBackgroundColor.setFill()
+        NSColor(calibratedWhite: 0.13, alpha: 1).setFill()
         bounds.fill()
 
         let plot = bounds.insetBy(dx: 10, dy: 24)
@@ -762,52 +762,43 @@ struct PortalRootView: View {
     let openAccessibility: () -> Void
     let resetArrangement: () -> Void
 
-    @State private var selectedTab: PortalTab = .control
-
-    private enum PortalTab: String, CaseIterable, Identifiable {
-        case control = "Control"
-        case arrangement = "Arrange"
-
-        var id: String { rawValue }
-    }
-
     var body: some View {
-        VStack(spacing: 18) {
-            header
-            tabSelector
+        ZStack {
+            Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 1))
 
-            Group {
-                switch selectedTab {
-                case .control:
+            VStack(spacing: 0) {
+                header
+                    .padding(.horizontal, 28)
+
+                TabView {
                     controlView
-                case .arrangement:
+                        .tabItem { Text("Control") }
                     arrangementTab
+                        .tabItem { Text("Arrange") }
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .padding(.horizontal, 28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            statsPanel
+                statsPanel
+            }
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 22)
-        .padding(.bottom, 16)
         .frame(width: 680, height: 520)
-        .background(Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 1)))
         .preferredColorScheme(.dark)
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Portal")
-                    .font(.system(size: 18, weight: .semibold))
+        HStack(spacing: 12) {
+            Spacer()
+
+            HStack(spacing: 7) {
+                Text("Status")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
                 Text(model.status)
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.primary)
                     .lineLimit(1)
             }
-
-            Spacer()
 
             Button(model.isRunning ? "Stop" : (model.isStarting ? "Starting..." : "Start"), action: toggleServer)
                 .buttonStyle(.borderedProminent)
@@ -815,17 +806,7 @@ struct PortalRootView: View {
                 .disabled(model.isStarting)
                 .frame(width: 104)
         }
-    }
-
-    private var tabSelector: some View {
-        Picker("", selection: $selectedTab) {
-            ForEach(PortalTab.allCases) { tab in
-                Text(tab.rawValue).tag(tab)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: 260)
+        .frame(height: 56)
     }
 
     private var controlView: some View {
@@ -865,6 +846,7 @@ struct PortalRootView: View {
                 }
             }
         }
+        .padding(.top, 20)
         .frame(maxWidth: .infinity, alignment: .top)
     }
 
@@ -896,6 +878,7 @@ struct PortalRootView: View {
                 .frame(width: 560, height: 238)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }
+        .padding(.top, 20)
         .frame(maxWidth: .infinity, alignment: .top)
     }
 
@@ -910,6 +893,7 @@ struct PortalRootView: View {
                 .frame(height: 48)
         }
         .frame(maxWidth: .infinity)
+        .padding(.bottom, 0)
     }
 
     @ViewBuilder
@@ -1989,6 +1973,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 680, height: 520)
         window.maxSize = NSSize(width: 680, height: 520)
+        window.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.styleMask.insert(.fullSizeContentView)
         positionWindowOnMainScreen()
         motionGraph.probe = motionProbe
         uiModel.port = portField.stringValue
