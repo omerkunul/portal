@@ -1,0 +1,5 @@
+version = 1
+
+[[actions]]
+name = "Run"
+command = "./script/build_and_run.sh"

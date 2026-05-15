@@ -1,0 +1,3 @@
+# The system Python bundled with Xcode often already includes PyObjC/Quartz.
+# If `python3 -c "import Quartz"` fails, install:
+pyobjc-framework-Quartz>=10.0
