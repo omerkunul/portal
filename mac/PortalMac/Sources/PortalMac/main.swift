@@ -762,39 +762,75 @@ struct PortalRootView: View {
     let openAccessibility: () -> Void
     let resetArrangement: () -> Void
 
+    @State private var selectedTab: PortalTab = .control
+
+    private enum PortalTab: String, CaseIterable, Identifiable {
+        case control = "Control"
+        case arrangement = "Arrange"
+
+        var id: String { rawValue }
+    }
+
     var body: some View {
-        TabView {
-            controlView
-                .tabItem { Text("Control") }
-            arrangementTab
-                .tabItem { Text("Arrangement") }
+        VStack(spacing: 18) {
+            header
+            tabSelector
+
+            Group {
+                switch selectedTab {
+                case .control:
+                    controlView
+                case .arrangement:
+                    arrangementTab
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+            statsPanel
         }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 22)
-        .frame(minWidth: 660, minHeight: 500)
-        .background(
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .controlBackgroundColor).opacity(0.92)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        .padding(.horizontal, 28)
+        .padding(.top, 22)
+        .padding(.bottom, 16)
+        .frame(width: 680, height: 520)
+        .background(Color(nsColor: NSColor(calibratedWhite: 0.13, alpha: 1)))
+        .preferredColorScheme(.dark)
+    }
+
+    private var header: some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Portal")
+                    .font(.system(size: 18, weight: .semibold))
+                Text(model.status)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button(model.isRunning ? "Stop" : (model.isStarting ? "Starting..." : "Start"), action: toggleServer)
+                .buttonStyle(.borderedProminent)
+                .tint(model.isRunning ? .red.opacity(0.85) : .portalOrange)
+                .disabled(model.isStarting)
+                .frame(width: 104)
+        }
+    }
+
+    private var tabSelector: some View {
+        Picker("", selection: $selectedTab) {
+            ForEach(PortalTab.allCases) { tab in
+                Text(tab.rawValue).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 260)
     }
 
     private var controlView: some View {
-        VStack(spacing: 18) {
-            Text("Portal")
-                .font(.title3.weight(.semibold))
-
+        VStack(spacing: 16) {
             settingsGrid {
-                SettingsRow("Connection") {
-                    Button(model.isRunning ? "Stop" : (model.isStarting ? "Starting..." : "Start"), action: toggleServer)
-                        .disabled(model.isStarting)
-                        .frame(width: 240)
-                }
                 SettingsRow("Port") {
                     TextField("", text: $model.port)
                         .textFieldStyle(.roundedBorder)
@@ -828,17 +864,12 @@ struct PortalRootView: View {
                     .toggleStyle(.switch)
                 }
             }
-
-            statsPanel
         }
-        .padding(.top, 8)
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var arrangementTab: some View {
-        VStack(spacing: 18) {
-            Text("Arrangement")
-                .font(.title3.weight(.semibold))
-
+        VStack(spacing: 16) {
             settingsGrid {
                 SettingsRow("Return edge") {
                     Picker("", selection: $model.edge) {
@@ -862,30 +893,23 @@ struct PortalRootView: View {
             }
 
             DisplayArrangementRepresentable(view: arrangementView)
-                .frame(width: 540, height: 240)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .frame(width: 560, height: 238)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
         }
-        .padding(.top, 8)
+        .frame(maxWidth: .infinity, alignment: .top)
     }
 
     private var statsPanel: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 2) {
             Text(model.stats)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .center)
             MotionGraphRepresentable(view: motionGraph)
-                .frame(height: 68)
+                .frame(height: 48)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
-        .frame(width: 540)
-        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
-        )
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -1957,13 +1981,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildWindow() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Portal"
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 600, height: 460)
+        window.minSize = NSSize(width: 680, height: 520)
+        window.maxSize = NSSize(width: 680, height: 520)
         positionWindowOnMainScreen()
         motionGraph.probe = motionProbe
         uiModel.port = portField.stringValue
