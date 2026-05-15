@@ -4,23 +4,6 @@ import Network
 import Darwin
 import SwiftUI
 
-enum PortalLog {
-    private static let url = URL(fileURLWithPath: "/tmp/portal-debug.log")
-
-    static func write(_ message: String) {
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            _ = try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: url)
-        }
-    }
-}
-
 enum Edge: String, CaseIterable {
     case left
     case right
@@ -743,6 +726,11 @@ final class PortalUIModel: ObservableObject {
     @Published var arrangement = "checking..."
 }
 
+extension Color {
+    static var portalOrange: Color { Color(nsColor: .systemOrange) }
+    static var portalGreen: Color { Color(nsColor: .systemGreen) }
+}
+
 struct MotionGraphRepresentable: NSViewRepresentable {
     let view: MotionGraphView
 
@@ -781,8 +769,19 @@ struct PortalRootView: View {
             arrangementTab
                 .tabItem { Text("Arrangement") }
         }
-        .padding(20)
-        .frame(minWidth: 640, minHeight: 480)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 22)
+        .frame(minWidth: 660, minHeight: 500)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(nsColor: .windowBackgroundColor),
+                    Color(nsColor: .controlBackgroundColor).opacity(0.92)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
     }
 
     private var controlView: some View {
@@ -882,7 +881,11 @@ struct PortalRootView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .frame(width: 540)
-        .background(.quaternary.opacity(0.7), in: RoundedRectangle(cornerRadius: 8))
+        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -1189,7 +1192,6 @@ final class PortalServer {
     private var lastStatsAt = Date()
 
     func start(port: UInt16, returnEdge: Edge) throws {
-        PortalLog.write("PortalServer.start begin")
         injector.returnEdge = returnEdge
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
@@ -1215,10 +1217,8 @@ final class PortalServer {
             self?.handle(connection)
         }
         listener.start(queue: networkQueue)
-        PortalLog.write("tcp listener start requested")
 
         try startUdpSocket(port: port)
-        PortalLog.write("udp socket started")
     }
 
     func stop() {
@@ -1287,7 +1287,6 @@ final class PortalServer {
     }
 
     private func startUdpSocket(port: UInt16) throws {
-        PortalLog.write("startUdpSocket begin port=\(port)")
         stopUdpSocket()
 
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -1320,7 +1319,6 @@ final class PortalServer {
         guard bindResult == 0 else {
             let error = errno
             Darwin.close(fd)
-            PortalLog.write("udp bind failed errno=\(error)")
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(error))
         }
 
@@ -1873,31 +1871,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var networkTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        PortalLog.write("app did finish launching")
         NSApp.setActivationPolicy(.regular)
         realtimeActivity = ProcessInfo.processInfo.beginActivity(
             options: [.userInteractive, .latencyCritical, .idleSystemSleepDisabled],
             reason: "Portal realtime mouse and keyboard sharing"
         )
-        PortalLog.write("activity started")
         server.motionProbe = motionProbe
         motionLogWriter = MotionLogWriter(probe: motionProbe)
-        PortalLog.write("motion log writer created")
         machineOffsets = loadMachineOffsets()
-        PortalLog.write("machine offsets loaded")
         arrangementView.machineOffsets = machineOffsets
         arrangementView.onOffsetsChanged = { [weak self] offsets in
             self?.machineOffsets = offsets
             self?.saveMachineOffsets(offsets)
             self?.server.sendLocalDisplayLayout()
         }
-        PortalLog.write("building window")
         buildWindow()
-        PortalLog.write("window built")
         showPortalWindow()
-        PortalLog.write("window shown")
         buildStatusItem()
-        PortalLog.write("status item built")
         server.onStatus = { [weak self] status in self?.setStatus(status) }
         server.onEvent = { [weak self] event in self?.recordEvent(event) }
         server.onStats = { [weak self] stats in
@@ -1923,13 +1913,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             send: { [weak self] payload in self?.server.sendClipboard(payload) ?? false },
             status: { [weak self] status in self?.clipboardLabel.stringValue = status }
         )
-        PortalLog.write("clipboard bridge started")
         eventLabel.stringValue = "Stats: idle"
         DispatchQueue.main.async { [weak self] in
-            PortalLog.write("auto start dispatch fired")
             self?.autoStartOnce()
         }
-        PortalLog.write("auto start scheduled")
         refreshAccessibilityStatus()
         accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.refreshAccessibilityStatus()
@@ -1937,7 +1924,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshNetworkStatus()
         refreshDisplayLabel()
         networkTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            if self?.running == true && self?.awdlSwitch.state == .off {
+            if self?.running == true && self?.uiModel.awdlEnabled == false {
                 _ = self?.setAwdlSync(enabled: false)
             }
             self?.refreshNetworkStatus()
@@ -1996,8 +1983,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func positionWindowOnMainScreen() {
-        let primaryScreen = NSScreen.screens.first { screen in
-            screen.frame.origin.x == 0 && screen.frame.origin.y == 0
+        let primaryScreen = NSScreen.screens.max {
+            ($0.visibleFrame.width * $0.visibleFrame.height) < ($1.visibleFrame.width * $1.visibleFrame.height)
         } ?? NSScreen.main
         guard let screen = primaryScreen else {
             window.center()
@@ -2069,7 +2056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleServer() {
-        PortalLog.write("toggleServer starting=\(starting) running=\(running)")
         if starting { return }
         if running {
             server.stop()
@@ -2080,54 +2066,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let port = UInt16(portField.stringValue) else {
-            statusLabel.stringValue = "Invalid port"
+        guard let port = UInt16(uiModel.port) else {
+            setStatus("Invalid port")
             return
         }
         refreshAccessibilityStatus()
-        let edge = Edge(rawValue: edgePopup.titleOfSelectedItem ?? "left") ?? .left
+        let edge = uiModel.edge
         starting = true
-        startButton.isEnabled = false
         statusStartStopItem?.isEnabled = false
+        uiModel.isStarting = true
         setStatus("Preparing low latency...")
         ensureAwdlSudoersReady { [weak self] ready in
             guard let self else { return }
-            PortalLog.write("awdl sudoers ready=\(ready)")
             if !ready {
                 self.starting = false
-                self.startButton.isEnabled = true
                 self.statusStartStopItem?.isEnabled = true
+                self.uiModel.isStarting = false
                 self.setStatus("Start cancelled: AWDL permission not installed")
                 self.refreshNetworkStatus()
                 return
             }
 
-            let awdlDisabled = self.setAwdlSync(enabled: false)
-            PortalLog.write("set awdl down sync result=\(awdlDisabled)")
+            _ = self.setAwdlSync(enabled: false)
             self.refreshNetworkStatus()
             self.startServer(port: port, edge: edge)
         }
     }
 
     private func startServer(port: UInt16, edge: Edge) {
-        PortalLog.write("startServer port=\(port) edge=\(edge.rawValue)")
         do {
             try server.start(port: port, returnEdge: edge)
-            PortalLog.write("server.start returned")
             running = true
             updateRunningControls()
         } catch {
-            PortalLog.write("server.start failed \(error.localizedDescription)")
             setStatus("Start failed: \(error.localizedDescription)")
             _ = setAwdlSync(enabled: true)
             refreshNetworkStatus()
         }
         starting = false
-        startButton.isEnabled = true
         statusStartStopItem?.isEnabled = true
+        uiModel.isStarting = false
     }
 
     @objc private func showPortalWindow() {
+        positionWindowOnMainScreen()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         window.makeFirstResponder(nil)
@@ -2141,11 +2123,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setStatus(_ status: String) {
         statusLabel.stringValue = status
+        uiModel.status = status
         updateStatusMenu()
     }
 
     private func updateRunningControls() {
         startButton.title = running ? "Stop" : "Start"
+        uiModel.isRunning = running
         updateStatusMenu()
     }
 
@@ -2166,6 +2150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestAccessibilityIfNeeded() {
         permissionLabel.stringValue = "Accessibility: use the enabled switch in System Settings"
         permissionLabel.textColor = .secondaryLabelColor
+        uiModel.accessibility = permissionLabel.stringValue
+        uiModel.accessibilityOK = false
         settingsButton.isHidden = false
     }
 
@@ -2181,7 +2167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleAwdlSwitch() {
-        setAwdl(enabled: awdlSwitch.state == .on, promptIfNeeded: true)
+        setAwdl(enabled: uiModel.awdlEnabled, promptIfNeeded: true)
     }
 
     @objc private func testMove() {
@@ -2204,12 +2190,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func recordEvent(_ event: String) {
         eventCount += 1
         eventLabel.stringValue = "Events \(eventCount) · \(event)"
+        uiModel.stats = eventLabel.stringValue
     }
 
     private func refreshAccessibilityStatus() {
         let trusted = AXIsProcessTrusted()
         permissionLabel.stringValue = trusted ? "Accessibility: granted" : "Accessibility: not trusted - click/keyboard will not work"
         permissionLabel.textColor = trusted ? .systemGreen : .systemOrange
+        uiModel.accessibility = permissionLabel.stringValue
+        uiModel.accessibilityOK = trusted
         settingsButton.isHidden = false
         if trusted {
             accessibilityTimer?.invalidate()
@@ -2224,16 +2213,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             awdlLabel.textColor = .systemOrange
             awdlSwitch.state = .on
             awdlSwitch.isEnabled = true
+            uiModel.awdlEnabled = true
+            uiModel.awdlText = awdlLabel.stringValue
+            uiModel.awdlColor = .portalOrange
         case false:
             awdlLabel.stringValue = "Disabled - low latency mode"
             awdlLabel.textColor = .systemGreen
             awdlSwitch.state = .off
             awdlSwitch.isEnabled = true
+            uiModel.awdlEnabled = false
+            uiModel.awdlText = awdlLabel.stringValue
+            uiModel.awdlColor = .portalGreen
         case nil:
             awdlLabel.stringValue = "Low latency: AWDL interface not found"
             awdlLabel.textColor = .secondaryLabelColor
             awdlSwitch.state = .off
             awdlSwitch.isEnabled = false
+            uiModel.awdlEnabled = false
+            uiModel.awdlText = awdlLabel.stringValue
+            uiModel.awdlColor = .secondary
         }
     }
 
@@ -2241,6 +2239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         awdlSwitch.isEnabled = false
         awdlLabel.stringValue = enabled ? "Enabling AWDL..." : "Disabling AWDL..."
         awdlLabel.textColor = .secondaryLabelColor
+        uiModel.awdlEnabled = enabled
+        uiModel.awdlText = awdlLabel.stringValue
+        uiModel.awdlColor = .secondary
 
         let action = enabled ? "up" : "down"
         let sudoProcess = Process()
@@ -2325,6 +2326,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         awdlLabel.stringValue = "Low latency: one-time admin permission required"
         awdlLabel.textColor = .systemOrange
+        uiModel.awdlText = awdlLabel.stringValue
+        uiModel.awdlColor = .portalOrange
         installAwdlSudoers { [weak self] installed in
             DispatchQueue.main.async {
                 let ready = installed && (self?.awdlSudoersReady() ?? false)
@@ -2396,6 +2399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshIpLabel() {
         let ips = localIPv4Addresses()
         ipLabel.stringValue = ips.isEmpty ? "IP: not found" : "IP: \(ips.joined(separator: ", "))"
+        uiModel.ip = ips.isEmpty ? "not found" : ips.joined(separator: ", ")
     }
 
     private func refreshDisplayLabel() {
@@ -2405,12 +2409,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         arrangementView.machineOffsets = machineOffsets
         guard !displays.isEmpty else {
             arrangementLabel.stringValue = "Arrangement: not found"
+            uiModel.arrangement = "not found"
             return
         }
         server.sendLocalDisplayLayout()
         let macSummary = displaySummary(displays)
         let windowsSummary = remoteWindowsDisplays.isEmpty ? "waiting" : displaySummary(remoteWindowsDisplays)
         arrangementLabel.stringValue = "Mac: \(macSummary)\nWindows: \(windowsSummary)"
+        uiModel.arrangement = "Mac: \(macSummary)\nWindows: \(windowsSummary)"
     }
 
     private func displaySummary(_ displays: [DisplayInfo]) -> String {
