@@ -76,6 +76,34 @@ Open it, enter the Mac IP and port, then press `Start`.
 
 For best capture behavior on Windows, run it as Administrator.
 
+## Install the Windows app
+
+After building the exe, create the installable package:
+
+```powershell
+.\windows\package-windows-installer.ps1
+```
+
+The package is created at:
+
+`dist\Portal-Windows-installer.zip`
+
+Unzip it on Windows and run:
+
+```powershell
+.\install-portal.ps1 -Launch
+```
+
+This installs Portal to:
+
+`%LOCALAPPDATA%\Programs\Portal`
+
+It also creates Start Menu, Desktop, and startup shortcuts. To skip those:
+
+```powershell
+.\install-portal.ps1 -NoDesktopShortcut -NoStartupShortcut
+```
+
 ## Remote Windows Build From Mac
 
 To avoid copying the project back and forth, prepare the Windows machine once:
