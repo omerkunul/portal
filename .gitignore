@@ -3,3 +3,6 @@ dist/
 mac/PortalMac/.build/
 .build/
 /tmp/
+.agents/
+.superpowers/
+skills-lock.json

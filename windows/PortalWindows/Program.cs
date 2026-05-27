@@ -2,9 +2,11 @@ using System.Buffers.Text;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Drawing.Imaging;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Threading;
 using System.Text;
 using System.Text.Json;
 using System.Globalization;
@@ -13,14 +15,17 @@ namespace PortalWindows;
 
 internal static class PortalTheme
 {
-    public static readonly Color Window = Color.FromArgb(24, 27, 25);
-    public static readonly Color Panel = Color.FromArgb(30, 34, 31);
-    public static readonly Color PanelAlt = Color.FromArgb(22, 24, 23);
-    public static readonly Color Border = Color.FromArgb(64, 72, 66);
-    public static readonly Color Grid = Color.FromArgb(44, 54, 49);
-    public static readonly Color Text = Color.FromArgb(232, 235, 231);
-    public static readonly Color Muted = Color.FromArgb(154, 162, 154);
-    public static readonly Color Accent = Color.FromArgb(72, 139, 255);
+    public static readonly Color Window = Color.FromArgb(18, 19, 23);
+    public static readonly Color Panel = Color.FromArgb(30, 31, 36);
+    public static readonly Color PanelAlt = Color.FromArgb(24, 25, 30);
+    public static readonly Color PanelHigh = Color.FromArgb(41, 42, 48);
+    public static readonly Color Border = Color.FromArgb(65, 71, 85);
+    public static readonly Color Grid = Color.FromArgb(48, 53, 64);
+    public static readonly Color Text = Color.FromArgb(227, 226, 231);
+    public static readonly Color Muted = Color.FromArgb(193, 198, 215);
+    public static readonly Color Accent = Color.FromArgb(0, 122, 255);
+    public static readonly Color Success = Color.FromArgb(50, 215, 75);
+    public static readonly Color Danger = Color.FromArgb(255, 69, 58);
     public static readonly Color Mac = Color.FromArgb(38, 166, 91);
     public static readonly Color Windows = Color.FromArgb(204, 118, 38);
     public static readonly Color WindowsSecondary = Color.FromArgb(180, 67, 199);
@@ -31,112 +36,166 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        using var singleInstance = new SingleInstanceGate();
+        if (!singleInstance.IsPrimaryInstance)
+        {
+            singleInstance.SignalPrimaryInstance();
+            return;
+        }
+
         try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High; } catch { }
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        using var form = new MainForm();
+        singleInstance.Attach(form);
+        Application.Run(form);
+    }
+}
+
+internal sealed class SingleInstanceGate : IDisposable
+{
+    private const string MutexName = @"Local\PortalWindows.Instance";
+    private const string ActivateEventName = @"Local\PortalWindows.Activate";
+
+    private readonly Mutex _mutex;
+    private readonly EventWaitHandle? _activateEvent;
+    private RegisteredWaitHandle? _activationWait;
+    private volatile bool _pendingActivation;
+
+    public bool IsPrimaryInstance { get; }
+
+    public SingleInstanceGate()
+    {
+        _mutex = new Mutex(initiallyOwned: true, name: MutexName, createdNew: out var createdNew);
+        IsPrimaryInstance = createdNew;
+        if (IsPrimaryInstance)
+        {
+            _activateEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivateEventName);
+        }
+    }
+
+    public void Attach(MainForm form)
+    {
+        if (!IsPrimaryInstance || _activateEvent == null) return;
+
+        form.HandleCreated += (_, _) =>
+        {
+            if (_pendingActivation)
+            {
+                _pendingActivation = false;
+                form.HandleActivationSignal();
+            }
+        };
+
+        _activationWait = ThreadPool.RegisterWaitForSingleObject(
+            _activateEvent,
+            (_, _) =>
+            {
+                try
+                {
+                    if (form.IsDisposed) return;
+                    if (form.IsHandleCreated)
+                    {
+                        form.BeginInvoke((MethodInvoker)form.HandleActivationSignal);
+                    }
+                    else
+                    {
+                        _pendingActivation = true;
+                    }
+                }
+                catch { }
+            },
+            null,
+            Timeout.Infinite,
+            executeOnlyOnce: false
+        );
+    }
+
+    public void SignalPrimaryInstance()
+    {
+        if (IsPrimaryInstance) return;
+        try
+        {
+            using var activateEvent = EventWaitHandle.OpenExisting(ActivateEventName);
+            activateEvent.Set();
+        }
+        catch { }
+    }
+
+    public void Dispose()
+    {
+        _activationWait?.Unregister(null);
+        _activateEvent?.Dispose();
+        if (IsPrimaryInstance)
+        {
+            try { _mutex.ReleaseMutex(); } catch { }
+        }
+        _mutex.Dispose();
     }
 }
 
 public sealed class MainForm : Form
 {
-    private readonly TabControl _tabs = new() { Dock = DockStyle.Fill };
-    private readonly TabPage _controlTab = new("Control");
-    private readonly TabPage _arrangementTab = new("Arrangement");
-    private readonly TextBox _ipBox = new() { Text = "192.168.1.12", Width = 180 };
-    private readonly NumericUpDown _portBox = new() { Minimum = 1, Maximum = 65535, Value = 45877, Width = 90 };
+    private static readonly string InputLogPath = Path.Combine(Path.GetTempPath(), "portal-windows-input.log");
+    private const int DiscoveryPort = 45878;
+    private readonly Panel _contentHost = new() { Dock = DockStyle.Fill };
+    private readonly Panel _controlTab = new() { Dock = DockStyle.Fill };
+    private readonly Label _pageTitle = new() { AutoSize = true, Text = "Control" };
+    private readonly TextBox _ipBox = new() { Text = "", Width = 180, ReadOnly = true };
+    private readonly NumericUpDown _portBox = new() { Minimum = 1, Maximum = 65535, Value = 45877, Width = 90, ReadOnly = true, Increment = 0 };
     private readonly ComboBox _edgeBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 90 };
     private readonly Label _status = new() { AutoSize = true, Text = "Stopped" };
     private readonly Label _stats = new() { AutoSize = true, Text = "Stats: idle" };
-    private readonly Label _displayInfo = new() { AutoSize = false, Text = "Displays: checking...", Width = 620, Height = 48 };
     private readonly Label _clipboardStatus = new() { AutoSize = false, Text = "Clipboard: starting...", Width = 620, Height = 28 };
-    private readonly Label _arrangementInfo = new() { AutoSize = false, Text = "Arrangement: checking...", Left = 24, Top = 58, Width = 900, Height = 42, Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right };
-    private readonly Button _fitArrangement = new() { Text = "Fit", Left = 24, Top = 108, Width = 72 };
-    private readonly Button _zoomOutArrangement = new() { Text = "-", Left = 104, Top = 108, Width = 40 };
-    private readonly Button _zoomInArrangement = new() { Text = "+", Left = 152, Top = 108, Width = 40 };
-    private readonly Button _actualArrangement = new() { Text = "100%", Left = 200, Top = 108, Width = 64 };
-    private readonly DisplayArrangementControl _arrangementView = new() { Left = 24, Top = 148, Width = 900, Height = 492, Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom };
+    private readonly DisplayArrangementControl _arrangementView = new() { Dock = DockStyle.Fill };
     private readonly Button _start = new() { Text = "Start", Width = 110 };
     private readonly System.Windows.Forms.Timer _clipboardTimer = new() { Interval = 700 };
     private readonly NotifyIcon _trayIcon = new();
     private readonly ContextMenuStrip _trayMenu = new();
     private readonly ToolStripMenuItem _trayStatus = new("Status: Stopped") { Enabled = false };
-    private readonly ToolStripMenuItem _trayShow = new("Show Portal");
     private readonly ToolStripMenuItem _trayStartStop = new("Start");
     private readonly ToolStripMenuItem _trayQuit = new("Quit Portal");
+    private readonly MacBeaconListener _beaconListener = new(DiscoveryPort);
     private PortalHost? _host;
     private bool _autoStarted;
     private bool _allowExit;
     private string? _lastClipboardSignature;
     private string? _lastAppliedClipboardSignature;
     private bool _applyingClipboard;
+    private string? _discoveredMacIp;
 
     public MainForm()
     {
         Text = "Portal";
-        ClientSize = new Size(960, 700);
-        MinimumSize = new Size(760, 560);
-        FormBorderStyle = FormBorderStyle.Sizable;
-        MaximizeBox = true;
+        ClientSize = new Size(360, 248);
+        MinimumSize = new Size(340, 220);
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false;
         Font = new Font("Segoe UI", 9F, FontStyle.Regular);
         BackColor = PortalTheme.Window;
         ForeColor = PortalTheme.Text;
         ApplyTheme(this);
-        ConfigureTabs();
-        _tabs.TabPages.Add(_controlTab);
-        _tabs.TabPages.Add(_arrangementTab);
-        Controls.Add(_tabs);
+        ConfigureShell();
         ConfigureTray();
 
         _edgeBox.Items.AddRange(["right", "left", "top", "bottom"]);
         _edgeBox.SelectedItem = "left";
         LoadSettings();
 
-        var title = new Label { Text = "Windows Host", AutoSize = true, Font = new Font(Font.FontFamily, 16F, FontStyle.Bold), Top = 24, Left = 24 };
-        _controlTab.Controls.Add(title);
-        AddRow("Mac IP", _ipBox, 62);
-        AddRow("Port", _portBox, 96);
-        AddRow("Exit edge", _edgeBox, 130);
-
-        _start.Left = 134;
-        _start.Top = 164;
-        _start.Click += Toggle;
-        _controlTab.Controls.Add(_start);
-
-        _status.Left = 254;
-        _status.Top = 170;
-        _controlTab.Controls.Add(_status);
-
-        _stats.Left = 24;
-        _stats.Top = 210;
-        _stats.Width = 450;
-        _controlTab.Controls.Add(_stats);
-
-        _displayInfo.Left = 24;
-        _displayInfo.Top = 250;
-        RefreshDisplayInfo();
-        _controlTab.Controls.Add(_displayInfo);
-
-        _clipboardStatus.Left = 24;
-        _clipboardStatus.Top = 306;
+        BuildControlTab();
         _clipboardStatus.Text = "Clipboard: text and images ready";
-        _controlTab.Controls.Add(_clipboardStatus);
+        RefreshDisplayInfo();
 
-        var arrangementTitle = new Label { Text = "Monitor Arrangement", AutoSize = true, Font = new Font(Font.FontFamily, 15F, FontStyle.Bold), Left = 24, Top = 26 };
-        _arrangementTab.Controls.Add(arrangementTitle);
-        _arrangementTab.Controls.Add(_arrangementInfo);
-        _fitArrangement.Click += (_, _) => _arrangementView.FitToContent();
-        _zoomOutArrangement.Click += (_, _) => _arrangementView.ZoomOut();
-        _zoomInArrangement.Click += (_, _) => _arrangementView.ZoomIn();
-        _actualArrangement.Click += (_, _) => _arrangementView.ActualSize();
-        _arrangementTab.Controls.Add(_fitArrangement);
-        _arrangementTab.Controls.Add(_zoomOutArrangement);
-        _arrangementTab.Controls.Add(_zoomInArrangement);
-        _arrangementTab.Controls.Add(_actualArrangement);
-        _arrangementTab.Controls.Add(_arrangementView);
-
+        ShowPage(_controlTab, "Control");
         ApplyTheme(this);
 
-        Shown += (_, _) => AutoStartOnce();
+        _beaconListener.BeaconReceived += OnMacBeaconReceived;
+        Load += (_, _) =>
+        {
+            ShowInTaskbar = false;
+            Opacity = 0;
+            AutoStartOnce();
+            Hide();
+        };
         _clipboardTimer.Tick += (_, _) => PublishLocalClipboardIfChanged();
         _clipboardTimer.Start();
     }
@@ -146,9 +205,6 @@ public sealed class MainForm : Form
         _trayIcon.Text = "Portal";
         _trayIcon.Icon = SystemIcons.Application;
         _trayIcon.Visible = true;
-        _trayIcon.DoubleClick += (_, _) => ShowPortalWindow();
-
-        _trayShow.Click += (_, _) => ShowPortalWindow();
         _trayStartStop.Click += Toggle;
         _trayQuit.Click += (_, _) =>
         {
@@ -158,7 +214,6 @@ public sealed class MainForm : Form
 
         _trayMenu.Items.Add(_trayStatus);
         _trayMenu.Items.Add(new ToolStripSeparator());
-        _trayMenu.Items.Add(_trayShow);
         _trayMenu.Items.Add(_trayStartStop);
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add(_trayQuit);
@@ -166,29 +221,156 @@ public sealed class MainForm : Form
         UpdateTrayItems();
     }
 
-    private void ConfigureTabs()
+    private void ConfigureShell()
     {
-        _tabs.DrawMode = TabDrawMode.OwnerDrawFixed;
-        _tabs.ItemSize = new Size(128, 34);
-        _tabs.SizeMode = TabSizeMode.Fixed;
-        _tabs.Appearance = TabAppearance.Normal;
-        _tabs.DrawItem += (_, e) =>
+        var shell = new TableLayoutPanel
         {
-            var selected = e.Index == _tabs.SelectedIndex;
-            var rect = e.Bounds;
-            rect.Inflate(-5, -5);
-            using var fill = new SolidBrush(selected ? PortalTheme.Accent : PortalTheme.Panel);
-            using var tabFont = new Font(Font.FontFamily, 9F, FontStyle.Bold);
-            e.Graphics.FillRectangle(fill, rect);
-            TextRenderer.DrawText(
-                e.Graphics,
-                _tabs.TabPages[e.Index].Text,
-                tabFont,
-                rect,
-                selected ? Color.White : PortalTheme.Muted,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
-            );
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = PortalTheme.Window
         };
+        shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        Controls.Add(shell);
+
+        var header = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = PortalTheme.Window,
+            Padding = new Padding(24, 18, 24, 12)
+        };
+        shell.Controls.Add(header, 0, 0);
+
+        _pageTitle.Font = new Font(Font.FontFamily, 20F, FontStyle.Bold);
+        _pageTitle.ForeColor = PortalTheme.Text;
+        _pageTitle.Location = new Point(0, 2);
+        header.Controls.Add(_pageTitle);
+
+        _status.AutoSize = false;
+        _status.Width = 260;
+        _status.Height = 26;
+        _status.Location = new Point(140, 6);
+        _status.Font = new Font(Font.FontFamily, 8.6F, FontStyle.Bold);
+        _status.ForeColor = PortalTheme.Muted;
+        header.Controls.Add(_status);
+
+        _start.Click += Toggle;
+        _start.Width = 112;
+        _start.Height = 34;
+        _start.Font = new Font(Font.FontFamily, 9.5F, FontStyle.Bold);
+        _start.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        header.Controls.Add(_start);
+        header.Resize += (_, _) => _start.Location = new Point(header.Width - _start.Width, 2);
+
+        _contentHost.BackColor = PortalTheme.Window;
+        _contentHost.Padding = new Padding(24, 12, 24, 24);
+        shell.Controls.Add(_contentHost, 0, 1);
+    }
+
+    private void ShowPage(Control page, string title)
+    {
+        _contentHost.Controls.Clear();
+        _contentHost.Controls.Add(page);
+        page.Dock = DockStyle.Fill;
+        _pageTitle.Text = title;
+    }
+
+    private void BuildControlTab()
+    {
+        var shell = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = PortalTheme.Window,
+            Padding = new Padding(0)
+        };
+        shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 118));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        _controlTab.Controls.Add(shell);
+
+        var networkCard = Card("Client", "Auto-connects to the Mac on your network");
+        AddField(networkCard, "Mac", _ipBox);
+        AddField(networkCard, "Exit edge", _edgeBox);
+
+        var statusCard = Card("Status", "Current bridge and clipboard state");
+        _status.Font = new Font(Font.FontFamily, 16F, FontStyle.Bold);
+        _status.ForeColor = PortalTheme.Muted;
+        _status.AutoSize = false;
+        _status.Height = 34;
+        _status.Dock = DockStyle.Top;
+        _stats.AutoSize = false;
+        _stats.Height = 28;
+        _stats.Dock = DockStyle.Top;
+        _stats.ForeColor = PortalTheme.Muted;
+        _clipboardStatus.Dock = DockStyle.Top;
+        _clipboardStatus.Height = 28;
+        _clipboardStatus.ForeColor = PortalTheme.Muted;
+        statusCard.Controls.Add(_clipboardStatus);
+        statusCard.Controls.Add(_stats);
+        statusCard.Controls.Add(_status);
+
+        shell.Controls.Add(networkCard, 0, 0);
+        shell.Controls.Add(statusCard, 0, 1);
+    }
+
+    private Panel Card(string title, string subtitle)
+    {
+        var panel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = PortalTheme.Panel,
+            Padding = new Padding(18),
+            Margin = new Padding(0, 0, 14, 14)
+        };
+        var titleLabel = new Label
+        {
+            Text = title,
+            Dock = DockStyle.Top,
+            Height = 26,
+            Font = new Font(Font.FontFamily, 12F, FontStyle.Bold),
+            ForeColor = PortalTheme.Text
+        };
+        var subtitleLabel = new Label
+        {
+            Text = subtitle,
+            Dock = DockStyle.Top,
+            Height = 24,
+            Font = new Font(Font.FontFamily, 8.6F, FontStyle.Regular),
+            ForeColor = PortalTheme.Muted
+        };
+        panel.Controls.Add(subtitleLabel);
+        panel.Controls.Add(titleLabel);
+        return panel;
+    }
+
+    private void AddField(Panel panel, string label, Control control)
+    {
+        var row = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 42,
+            ColumnCount = 2,
+            BackColor = PortalTheme.Panel,
+            Padding = new Padding(0, 4, 0, 4)
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
+        var labelView = new Label
+        {
+            Text = label,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = PortalTheme.Muted
+        };
+        control.Dock = DockStyle.Fill;
+        control.Margin = new Padding(0, 3, 0, 3);
+        row.Controls.Add(labelView, 0, 0);
+        row.Controls.Add(control, 1, 0);
+        panel.Controls.Add(row);
+        row.BringToFront();
     }
 
     private static void ApplyTheme(Control root)
@@ -259,6 +441,12 @@ public sealed class MainForm : Form
             return;
         }
 
+        if (string.IsNullOrWhiteSpace(_ipBox.Text))
+        {
+            SetStatus("Waiting for Mac");
+            return;
+        }
+
         _host = new PortalHost(_ipBox.Text.Trim(), (int)_portBox.Value, _edgeBox.Text);
         SaveSettings();
         _host.StatusChanged += text => BeginInvoke((MethodInvoker)(() => SetStatus(text)));
@@ -267,17 +455,19 @@ public sealed class MainForm : Form
         _host.ArrangementOffsetsChanged += offsets => BeginInvoke((MethodInvoker)(() =>
         {
             _arrangementView.MachineOffsets = offsets;
-            UpdateArrangementInfo();
         }));
         _host.RemoteDisplaysChanged += displays => BeginInvoke((MethodInvoker)(() =>
         {
             _arrangementView.MacDisplays = displays;
-            UpdateArrangementInfo();
         }));
         _host.Stopped += () => BeginInvoke((MethodInvoker)(() =>
         {
             _host = null;
             UpdateTrayItems();
+            if (!string.IsNullOrWhiteSpace(_discoveredMacIp))
+            {
+                BeginInvoke((MethodInvoker)(() => Toggle(this, EventArgs.Empty)));
+            }
         }));
         try
         {
@@ -292,8 +482,13 @@ public sealed class MainForm : Form
         }
     }
 
-    private void ShowPortalWindow()
+    internal void HandleActivationSignal()
     {
+    }
+
+    internal void ShowPortalWindow()
+    {
+        Opacity = 1;
         Show();
         WindowState = FormWindowState.Normal;
         ShowInTaskbar = true;
@@ -313,6 +508,8 @@ public sealed class MainForm : Form
     {
         var running = _host != null;
         _start.Text = running ? "Stop" : "Start";
+        _start.BackColor = running ? PortalTheme.Danger : PortalTheme.Accent;
+        _start.ForeColor = Color.White;
         _trayStartStop.Text = running ? "Stop" : "Start";
     }
 
@@ -321,7 +518,8 @@ public sealed class MainForm : Form
         RefreshDisplayInfo();
         if (_autoStarted) return;
         _autoStarted = true;
-        if (_host == null)
+        _beaconListener.Start();
+        if (_host == null && !string.IsNullOrWhiteSpace(_ipBox.Text))
         {
             Toggle(this, EventArgs.Empty);
         }
@@ -332,12 +530,14 @@ public sealed class MainForm : Form
         if (!_allowExit && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
+            Opacity = 0;
             Hide();
             ShowInTaskbar = false;
             return;
         }
 
         _clipboardTimer.Stop();
+        _beaconListener.Dispose();
         SaveSettings();
         _host?.Stop();
         _trayIcon.Visible = false;
@@ -350,6 +550,7 @@ public sealed class MainForm : Form
         base.OnResize(e);
         if (WindowState == FormWindowState.Minimized)
         {
+            Opacity = 0;
             Hide();
             ShowInTaskbar = false;
         }
@@ -404,6 +605,7 @@ public sealed class MainForm : Form
             if (packet.ContentType == "text/plain" && packet.Text != null)
             {
                 Clipboard.SetText(packet.Text, TextDataFormat.UnicodeText);
+                DebugLog($"clipboard applied text bytes={packet.Text.Length}");
                 _clipboardStatus.Text = "Clipboard: received text";
             }
             else if (packet.ContentType == "image/png" && packet.DataBase64 != null)
@@ -418,6 +620,7 @@ public sealed class MainForm : Form
                 using var stream = new MemoryStream(bytes);
                 using var image = Image.FromStream(stream);
                 Clipboard.SetImage(new Bitmap(image));
+                DebugLog($"clipboard applied image bytes={bytes.Length}");
                 _clipboardStatus.Text = "Clipboard: received image";
             }
             else
@@ -428,8 +631,9 @@ public sealed class MainForm : Form
             _lastAppliedClipboardSignature = signature;
             _lastClipboardSignature = signature;
         }
-        catch
+        catch (Exception ex)
         {
+            DebugLog($"clipboard apply failed {ex.GetType().Name}: {ex.Message}");
             _clipboardStatus.Text = "Clipboard: update failed";
         }
         finally
@@ -438,18 +642,27 @@ public sealed class MainForm : Form
         }
     }
 
+    private static void DebugLog(string message)
+    {
+        try
+        {
+            File.AppendAllText(InputLogPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        }
+        catch { }
+    }
+
     private void LoadSettings()
     {
         try
         {
             var settings = AppSettings.Load();
-            _ipBox.Text = string.IsNullOrWhiteSpace(settings.MacIp) ? "192.168.1.12" : settings.MacIp;
+            _ipBox.Text = settings.MacIp?.Trim() ?? "";
             _portBox.Value = Math.Clamp(settings.Port <= 0 ? 45877 : settings.Port, 1, 65535);
-            _edgeBox.SelectedItem = "left";
+            _edgeBox.SelectedItem = _edgeBox.Items.Contains(settings.Edge) ? settings.Edge : "left";
         }
         catch
         {
-            _ipBox.Text = "192.168.1.12";
+            _ipBox.Text = "";
             _portBox.Value = 45877;
             _edgeBox.SelectedItem = "left";
         }
@@ -467,6 +680,37 @@ public sealed class MainForm : Form
             });
         }
         catch { }
+    }
+
+    private void OnMacBeaconReceived(MacBeacon beacon)
+    {
+        if (InvokeRequired)
+        {
+            BeginInvoke((MethodInvoker)(() => OnMacBeaconReceived(beacon)));
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(beacon.IpAddress)) return;
+        _discoveredMacIp = beacon.IpAddress;
+        var settingsChanged = false;
+        if (beacon.Port is >= 1 and <= 65535 && _portBox.Value != beacon.Port)
+        {
+            _portBox.Value = beacon.Port;
+            settingsChanged = true;
+        }
+        if (_ipBox.Text != beacon.IpAddress)
+        {
+            _ipBox.Text = beacon.IpAddress;
+            settingsChanged = true;
+        }
+        if (settingsChanged)
+        {
+            SaveSettings();
+        }
+        if (_host == null)
+        {
+            Toggle(this, EventArgs.Empty);
+        }
     }
 
     private static List<DisplayBox> LocalDisplays()
@@ -497,23 +741,14 @@ public sealed class MainForm : Form
     private void RefreshDisplayInfo()
     {
         var displays = LocalDisplays();
-        _displayInfo.Text = DisplaySummary("Displays", displays);
         _arrangementView.WindowsDisplays = displays;
-        UpdateArrangementInfo();
-    }
-
-    private void UpdateArrangementInfo()
-    {
-        _arrangementInfo.Text =
-            $"{DisplaySummary("Mac", _arrangementView.MacDisplays)}{Environment.NewLine}" +
-            $"{DisplaySummary("Windows", _arrangementView.WindowsDisplays)}";
     }
 
 }
 
 public sealed class AppSettings
 {
-    public string MacIp { get; set; } = "192.168.1.12";
+    public string MacIp { get; set; } = "";
     public int Port { get; set; } = 45877;
     public string Edge { get; set; } = "left";
 
@@ -547,6 +782,89 @@ public sealed class AppSettings
 public sealed record DisplayBox(string Name, Rectangle Bounds, bool Primary);
 
 public sealed record ClipboardPacket(string Id, string ContentType, string? Text, string? DataBase64);
+
+internal sealed record MacBeacon(string IpAddress, int Port);
+
+internal sealed class MacBeaconListener : IDisposable
+{
+    private readonly int _port;
+    private readonly CancellationTokenSource _cts = new();
+    private UdpClient? _client;
+    private Task? _task;
+
+    public event Action<MacBeacon>? BeaconReceived;
+
+    public MacBeaconListener(int port)
+    {
+        _port = port;
+    }
+
+    public void Start()
+    {
+        if (_task != null) return;
+
+        var client = new UdpClient();
+        client.ExclusiveAddressUse = false;
+        client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        client.Client.Bind(new IPEndPoint(IPAddress.Any, _port));
+        _client = client;
+        _task = Task.Run(() => ReceiveLoopAsync(client, _cts.Token));
+    }
+
+    public void Dispose()
+    {
+        _cts.Cancel();
+        try { _client?.Close(); } catch { }
+        try { _task?.Wait(500); } catch { }
+        _client?.Dispose();
+        _cts.Dispose();
+    }
+
+    private async Task ReceiveLoopAsync(UdpClient client, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            UdpReceiveResult packet;
+            try
+            {
+                packet = await client.ReceiveAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch
+            {
+                continue;
+            }
+
+            try
+            {
+                using var json = JsonDocument.Parse(packet.Buffer);
+                var root = json.RootElement;
+                if (!root.TryGetProperty("type", out var typeNode) ||
+                    !string.Equals(typeNode.GetString(), "portalMacBeacon", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var ipAddress = root.TryGetProperty("ip", out var ipNode) ? ipNode.GetString() : null;
+                var port = root.TryGetProperty("port", out var portNode) && portNode.TryGetInt32(out var parsedPort)
+                    ? parsedPort
+                    : 45877;
+                if (string.IsNullOrWhiteSpace(ipAddress)) continue;
+                BeaconReceived?.Invoke(new MacBeacon(ipAddress.Trim(), port));
+            }
+            catch
+            {
+            }
+        }
+    }
+}
 
 internal static class PortalClipboard
 {
@@ -634,19 +952,11 @@ internal sealed class DisplayArrangementControl : Control
 {
     private const float CanvasPadding = 24f;
     private const float FitScalePadding = 0.86f;
-    private const float ActualSizeScale = 0.12f;
-    private const float MinScale = 0.01f;
-    private const float MaxScale = 0.80f;
     private List<DisplayBox> _windowsDisplays = [];
     private List<DisplayBox> _macDisplays = [];
     private Dictionary<string, PointF> _machineOffsets = new(StringComparer.OrdinalIgnoreCase);
-    private bool _manualViewport;
     private float _scale;
     private PointF _pan;
-    private RectangleF _lastUnion;
-    private bool _dragging;
-    private Point _dragStart;
-    private PointF _dragStartPan;
 
     public List<DisplayBox> WindowsDisplays
     {
@@ -654,7 +964,6 @@ internal sealed class DisplayArrangementControl : Control
         set
         {
             _windowsDisplays = value;
-            _manualViewport = false;
             Invalidate();
         }
     }
@@ -665,7 +974,6 @@ internal sealed class DisplayArrangementControl : Control
         set
         {
             _macDisplays = value;
-            _manualViewport = false;
             Invalidate();
         }
     }
@@ -676,7 +984,6 @@ internal sealed class DisplayArrangementControl : Control
         set
         {
             _machineOffsets = value;
-            _manualViewport = false;
             Invalidate();
         }
     }
@@ -685,49 +992,7 @@ internal sealed class DisplayArrangementControl : Control
     {
         DoubleBuffered = true;
         ResizeRedraw = true;
-        TabStop = true;
         BackColor = PortalTheme.PanelAlt;
-        SetStyle(ControlStyles.Selectable, true);
-        SetStyle(ControlStyles.UserMouse, true);
-    }
-
-    public void FitToContent()
-    {
-        var boxes = ArrangementBoxes();
-        if (boxes.Count == 0)
-        {
-            _manualViewport = false;
-            Invalidate();
-            return;
-        }
-
-        FitViewport(boxes, DrawingArea(ClientCanvas()));
-        _manualViewport = true;
-        Invalidate();
-    }
-
-    public void ActualSize()
-    {
-        var canvas = ClientCanvas();
-        var boxes = ArrangementBoxes();
-        if (boxes.Count == 0) return;
-        var union = VirtualUnion(boxes);
-        _scale = ActualSizeScale;
-        CenterUnion(union, DrawingArea(canvas), _scale);
-        _manualViewport = true;
-        Invalidate();
-    }
-
-    public void ZoomIn()
-    {
-        var canvas = ClientCanvas();
-        ZoomAt(new PointF(canvas.Width / 2f, canvas.Height / 2f), 1.2f);
-    }
-
-    public void ZoomOut()
-    {
-        var canvas = ClientCanvas();
-        ZoomAt(new PointF(canvas.Width / 2f, canvas.Height / 2f), 1f / 1.2f);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -762,10 +1027,7 @@ internal sealed class DisplayArrangementControl : Control
         var drawing = DrawingArea(canvas);
         if (drawing.Width <= 1 || drawing.Height <= 1) return;
 
-        if (!_manualViewport || _scale <= 0 || UnionChanged(union))
-        {
-            FitViewport(boxes, drawing);
-        }
+        FitViewport(boxes, drawing);
 
         var visible = Map(union, _scale, _pan);
 
@@ -806,80 +1068,6 @@ internal sealed class DisplayArrangementControl : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        _manualViewport = false;
-        Invalidate();
-    }
-
-    protected override void OnMouseEnter(EventArgs e)
-    {
-        base.OnMouseEnter(e);
-        Focus();
-    }
-
-    protected override void OnMouseDown(MouseEventArgs e)
-    {
-        base.OnMouseDown(e);
-        Focus();
-        if (e.Button != MouseButtons.Left) return;
-        _dragging = true;
-        _dragStart = e.Location;
-        _dragStartPan = _pan;
-        Cursor = Cursors.SizeAll;
-        Capture = true;
-    }
-
-    protected override void OnMouseMove(MouseEventArgs e)
-    {
-        base.OnMouseMove(e);
-        if (!_dragging) return;
-        _manualViewport = true;
-        _pan = new PointF(
-            _dragStartPan.X + e.X - _dragStart.X,
-            _dragStartPan.Y + e.Y - _dragStart.Y
-        );
-        Invalidate();
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        if (e.Button != MouseButtons.Left) return;
-        _dragging = false;
-        Cursor = Cursors.Default;
-        Capture = false;
-    }
-
-    protected override void OnMouseWheel(MouseEventArgs e)
-    {
-        base.OnMouseWheel(e);
-        ZoomAt(e.Location, e.Delta > 0 ? 1.15f : 1f / 1.15f);
-    }
-
-    protected override void OnDoubleClick(EventArgs e)
-    {
-        base.OnDoubleClick(e);
-        FitToContent();
-    }
-
-    private void ZoomAt(PointF anchor, float factor)
-    {
-        if (_scale <= 0)
-        {
-            var boxes = ArrangementBoxes();
-            if (boxes.Count == 0) return;
-            FitViewport(boxes, DrawingArea(ClientCanvas()));
-        }
-
-        var before = new PointF(
-            (anchor.X - _pan.X) / _scale,
-            (anchor.Y - _pan.Y) / _scale
-        );
-        _scale = Math.Clamp(_scale * factor, MinScale, MaxScale);
-        _pan = new PointF(
-            anchor.X - before.X * _scale,
-            anchor.Y - before.Y * _scale
-        );
-        _manualViewport = true;
         Invalidate();
     }
 
@@ -887,20 +1075,9 @@ internal sealed class DisplayArrangementControl : Control
     {
         var union = VirtualUnion(boxes);
         var fitScale = Math.Min(drawing.Width / Math.Max(1, union.Width), drawing.Height / Math.Max(1, union.Height));
-        _scale = Math.Clamp(fitScale * FitScalePadding, MinScale, MaxScale);
+        _scale = Math.Max(0.02f, fitScale * FitScalePadding);
         CenterDisplays(boxes, drawing, _scale);
         ClampPanToUnion(union, drawing, _scale);
-        _lastUnion = union;
-    }
-
-    private void CenterUnion(RectangleF union, RectangleF drawing, float scale)
-    {
-        var drawnWidth = union.Width * scale;
-        var drawnHeight = union.Height * scale;
-        _pan = new PointF(
-            drawing.Left + (drawing.Width - drawnWidth) / 2f - union.Left * scale,
-            drawing.Top + (drawing.Height - drawnHeight) / 2f - union.Top * scale
-        );
     }
 
     private void CenterDisplays(IReadOnlyList<ArrangementBox> boxes, RectangleF drawing, float scale)
@@ -927,6 +1104,16 @@ internal sealed class DisplayArrangementControl : Control
         _pan = new PointF(
             drawing.Left + drawing.Width / 2f - centerX * scale,
             drawing.Top + drawing.Height / 2f - centerY * scale
+        );
+    }
+
+    private void CenterUnion(RectangleF union, RectangleF drawing, float scale)
+    {
+        var drawnWidth = union.Width * scale;
+        var drawnHeight = union.Height * scale;
+        _pan = new PointF(
+            drawing.Left + (drawing.Width - drawnWidth) / 2f - union.Left * scale,
+            drawing.Top + (drawing.Height - drawnHeight) / 2f - union.Top * scale
         );
     }
 
@@ -963,14 +1150,6 @@ internal sealed class DisplayArrangementControl : Control
     private static RectangleF VirtualUnion(IReadOnlyList<ArrangementBox> boxes)
     {
         return boxes.Skip(1).Aggregate(boxes[0].VirtualBounds, (acc, box) => RectangleF.Union(acc, box.VirtualBounds));
-    }
-
-    private bool UnionChanged(RectangleF union)
-    {
-        return Math.Abs(union.Left - _lastUnion.Left) > 0.5f ||
-               Math.Abs(union.Top - _lastUnion.Top) > 0.5f ||
-               Math.Abs(union.Width - _lastUnion.Width) > 0.5f ||
-               Math.Abs(union.Height - _lastUnion.Height) > 0.5f;
     }
 
     private List<ArrangementBox> ArrangementBoxes()
@@ -1056,6 +1235,7 @@ internal sealed class DisplayArrangementControl : Control
 
 public sealed class PortalHost
 {
+    private static readonly string InputLogPath = Path.Combine(Path.GetTempPath(), "portal-windows-input.log");
     private const int WH_MOUSE_LL = 14;
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_MOUSEMOVE = 0x0200;
@@ -1076,13 +1256,15 @@ public sealed class PortalHost
     private const int XBUTTON1 = 1;
     private const int XBUTTON2 = 2;
     private const int LLMHF_INJECTED = 0x00000001;
+    private const int LLKHF_INJECTED = 0x00000010;
     private const long PinIntervalMs = 16;
-    private const double MouseFlushIntervalMs = 4.0;
+    private const double MouseFlushIntervalMs = 1.0;
     private static readonly bool LiveStatsEnabled = false;
 
     private readonly string _macIp;
     private readonly int _port;
     private readonly string _edge;
+    private string _activeEdge;
     private readonly object _gate = new();
     private readonly object _sendLock = new();
     private readonly LowLevelMouseProc _mouseProc;
@@ -1095,14 +1277,22 @@ public sealed class PortalHost
     private RawMousePump? _rawMousePump;
     private readonly AutoResetEvent _sendSignal = new(false);
     private Thread? _senderThread;
+    private Thread? _edgeMonitorThread;
     private IntPtr _mouseHook;
     private IntPtr _keyboardHook;
     private bool _running;
     private bool _remoteActive;
+    private bool _controlledByMac;
+    private bool _activationPending;
+    private DateTime _suppressActivationUntil = DateTime.MinValue;
     private Point? _lastPos;
     private bool _ctrl;
     private bool _alt;
     private Rectangle _activeScreenBounds;
+    private Rectangle _targetScreenBounds;
+    private string _targetReturnEdge = "left";
+    private List<DisplayBox> _remoteDisplays = [];
+    private Dictionary<string, PointF> _machineOffsets = new(StringComparer.OrdinalIgnoreCase);
     private int _pendingDx;
     private int _pendingDy;
     private int _pendingRawCount;
@@ -1129,6 +1319,7 @@ public sealed class PortalHost
         _macIp = macIp;
         _port = port;
         _edge = edge;
+        _activeEdge = edge;
         _mouseProc = MouseHook;
         _keyboardProc = KeyboardHook;
     }
@@ -1146,8 +1337,13 @@ public sealed class PortalHost
             Name = "Portal mouse sender"
         };
         _senderThread.Start();
-        _rawMousePump = new RawMousePump(HandleRawMouseDelta);
-        _rawMousePump.Start();
+        _edgeMonitorThread = new Thread(EdgeMonitorLoop)
+        {
+            IsBackground = true,
+            Priority = ThreadPriority.AboveNormal,
+            Name = "Portal edge monitor"
+        };
+        _edgeMonitorThread.Start();
         _worker = new Thread(ConnectLoop) { IsBackground = true };
         _worker.Start();
     }
@@ -1156,9 +1352,7 @@ public sealed class PortalHost
     {
         _running = false;
         _sendSignal.Set();
-        UninstallHooks();
-        _rawMousePump?.Dispose();
-        _rawMousePump = null;
+        DisableRemoteCapture();
         try { _client?.Close(); } catch { }
         try { _udp?.Dispose(); } catch { }
         _udp = null;
@@ -1175,25 +1369,22 @@ public sealed class PortalHost
                 StatusChanged?.Invoke("Connecting...");
                 _client = new TcpClient { NoDelay = true };
                 _client.Connect(_macIp, _port);
+                ConfigureLowLatencySocket(_client.Client);
                 _stream = _client.GetStream();
                 _udp?.Dispose();
                 _udp = new UdpClient();
                 _udp.Client.Blocking = false;
                 _udp.Client.SendBufferSize = 256 * 1024;
+                ConfigureLowLatencySocket(_udp.Client);
                 _udp.Connect(_macIp, _port);
                 StatusChanged?.Invoke("Connected");
                 SendDisplayLayout();
                 _uiThread?.BeginInvoke((MethodInvoker)(() =>
                 {
-                    try
+                    if (InstallKeyboardHook())
                     {
-                        InstallHooks();
+                        DebugLog("keyboard hook ready");
                         StatusChanged?.Invoke("Running");
-                    }
-                    catch (Exception ex)
-                    {
-                        StatusChanged?.Invoke(ex.Message);
-                        Stop();
                     }
                 }));
                 Task.Run(ReadLoop);
@@ -1202,7 +1393,7 @@ public sealed class PortalHost
             catch
             {
                 lock (_gate) _remoteActive = false;
-                UninstallHooks();
+                _uiThread?.BeginInvoke((MethodInvoker)DisableRemoteCapture);
                 Thread.Sleep(1500);
             }
         }
@@ -1224,7 +1415,7 @@ public sealed class PortalHost
             catch
             {
                 lock (_gate) _remoteActive = false;
-                UninstallHooks();
+                _uiThread?.BeginInvoke((MethodInvoker)DisableRemoteCapture);
                 ConnectLoop();
                 return;
             }
@@ -1242,6 +1433,16 @@ public sealed class PortalHost
 
     private void HandleControlLine(string line)
     {
+        if (line.Length > 0 && line[0] == 'm')
+        {
+            var move = ParseIncomingMoveLine(line);
+            if (move.HasValue && _controlledByMac)
+            {
+                ApplyRemoteMove(move.Value.dx, move.Value.dy);
+            }
+            return;
+        }
+
         try
         {
             using var document = JsonDocument.Parse(line);
@@ -1250,23 +1451,111 @@ public sealed class PortalHost
 
             switch (typeElement.GetString())
             {
+                case "activate":
+                    var edgeName = root.TryGetProperty("edge", out var edgeValue) && edgeValue.ValueKind == JsonValueKind.String
+                        ? edgeValue.GetString()
+                        : null;
+                    var sourceDisplay = root.TryGetProperty("screen", out var screenValue) && screenValue.ValueKind == JsonValueKind.Object
+                        ? ParseDisplayInfo(screenValue)
+                        : null;
+                    if (!string.IsNullOrWhiteSpace(edgeName))
+                    {
+                        var activateX = root.TryGetProperty("xRatio", out var activateXValue) && activateXValue.ValueKind == JsonValueKind.Number
+                            ? Math.Clamp(activateXValue.GetDouble(), 0.0, 1.0)
+                            : 0.5;
+                        var activateY = root.TryGetProperty("yRatio", out var activateYValue) && activateYValue.ValueKind == JsonValueKind.Number
+                            ? Math.Clamp(activateYValue.GetDouble(), 0.0, 1.0)
+                            : 0.5;
+                        ActivateFromMac(edgeName!, activateX, activateY, sourceDisplay);
+                    }
+                    break;
                 case "release":
                     var (xRatio, yRatio) = ParseReleaseRatios(root);
                     ReleaseToWindows(xRatio, yRatio);
                     break;
+                case "move":
+                    if (_controlledByMac)
+                    {
+                        var moveDx = root.TryGetProperty("dx", out var moveDxValue) && moveDxValue.ValueKind == JsonValueKind.Number
+                            ? (int)Math.Round(moveDxValue.GetDouble())
+                            : 0;
+                        var moveDy = root.TryGetProperty("dy", out var moveDyValue) && moveDyValue.ValueKind == JsonValueKind.Number
+                            ? (int)Math.Round(moveDyValue.GetDouble())
+                            : 0;
+                        ApplyRemoteMove(moveDx, moveDy);
+                    }
+                    break;
+                case "button":
+                    if (_controlledByMac)
+                    {
+                        var buttonName = root.TryGetProperty("button", out var buttonValue) && buttonValue.ValueKind == JsonValueKind.String
+                            ? buttonValue.GetString() ?? "left"
+                            : "left";
+                        var buttonDown = root.TryGetProperty("down", out var downValue) &&
+                                         (downValue.ValueKind == JsonValueKind.True || downValue.ValueKind == JsonValueKind.False) &&
+                                         downValue.GetBoolean();
+                        InjectMouseButton(buttonName, buttonDown);
+                    }
+                    break;
+                case "scroll":
+                    if (_controlledByMac)
+                    {
+                        var scrollDx = root.TryGetProperty("dx", out var scrollDxValue) && scrollDxValue.ValueKind == JsonValueKind.Number
+                            ? (int)Math.Round(scrollDxValue.GetDouble())
+                            : 0;
+                        var scrollDy = root.TryGetProperty("dy", out var scrollDyValue) && scrollDyValue.ValueKind == JsonValueKind.Number
+                            ? (int)Math.Round(scrollDyValue.GetDouble())
+                            : 0;
+                        InjectScroll(scrollDx, scrollDy);
+                    }
+                    break;
+                case "key":
+                    if (_controlledByMac)
+                    {
+                        var keyName = root.TryGetProperty("key", out var keyValue) && keyValue.ValueKind == JsonValueKind.String
+                            ? keyValue.GetString()
+                            : null;
+                        var keyDown = root.TryGetProperty("down", out var keyDownValue) &&
+                                      (keyDownValue.ValueKind == JsonValueKind.True || keyDownValue.ValueKind == JsonValueKind.False) &&
+                                      keyDownValue.GetBoolean();
+                        if (!string.IsNullOrWhiteSpace(keyName))
+                        {
+                            InjectKey(keyName!, keyDown);
+                        }
+                    }
+                    break;
                 case "displayLayout":
                     var displays = ParseDisplayLayout(root);
-                    if (displays.Count > 0) RemoteDisplaysChanged?.Invoke(displays);
                     var offsets = ParseMachineOffsets(root);
+                    lock (_gate)
+                    {
+                        if (displays.Count > 0) _remoteDisplays = displays;
+                        if (root.TryGetProperty("machineOffsets", out _)) _machineOffsets = offsets;
+                    }
+                    if (displays.Count > 0) RemoteDisplaysChanged?.Invoke(displays);
                     if (root.TryGetProperty("machineOffsets", out _)) ArrangementOffsetsChanged?.Invoke(offsets);
                     break;
                 case "clipboard":
                     var clipboardPacket = PortalClipboard.FromJson(root);
-                    if (clipboardPacket != null) ClipboardReceived?.Invoke(clipboardPacket);
+                    if (clipboardPacket != null)
+                    {
+                        DebugLog($"clipboard received {clipboardPacket.ContentType} textBytes={clipboardPacket.Text?.Length ?? 0} dataBytes={clipboardPacket.DataBase64?.Length ?? 0}");
+                        ClipboardReceived?.Invoke(clipboardPacket);
+                    }
                     break;
             }
         }
         catch { }
+    }
+
+    private static (int dx, int dy, int raw)? ParseIncomingMoveLine(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 4 || parts[0] != "m") return null;
+        if (!int.TryParse(parts[1], out var dx)) return null;
+        if (!int.TryParse(parts[2], out var dy)) return null;
+        if (!int.TryParse(parts[3], out var raw)) raw = 1;
+        return (dx, dy, raw);
     }
 
     private static (double? xRatio, double? yRatio) ParseReleaseRatios(JsonElement root)
@@ -1304,6 +1593,21 @@ public sealed class PortalHost
         }
 
         return displays;
+    }
+
+    private static DisplayBox? ParseDisplayInfo(JsonElement item)
+    {
+        var width = ReadInt(item, "width");
+        var height = ReadInt(item, "height");
+        if (width <= 0 || height <= 0) return null;
+        var name = item.TryGetProperty("name", out var nameElement) && nameElement.ValueKind == JsonValueKind.String
+            ? nameElement.GetString() ?? "Display 1"
+            : "Display 1";
+        var x = ReadInt(item, "x");
+        var y = ReadInt(item, "y");
+        var primary = item.TryGetProperty("primary", out var primaryElement) &&
+                      primaryElement.ValueKind == JsonValueKind.True;
+        return new DisplayBox(name, new Rectangle(x, y, width, height), primary);
     }
 
     private static Dictionary<string, PointF> ParseMachineOffsets(JsonElement root)
@@ -1494,6 +1798,13 @@ public sealed class PortalHost
         SendMoveLine(dx, dy, rawCount);
     }
 
+    private static void ConfigureLowLatencySocket(Socket socket)
+    {
+        try { socket.NoDelay = true; } catch { }
+        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10); } catch { }
+        try { socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.DontLinger, true); } catch { }
+    }
+
     private void SendMoveLine(int dx, int dy, int rawCount)
     {
         if (_stream == null || _client?.Connected != true) return;
@@ -1560,23 +1871,217 @@ public sealed class PortalHost
         StatsChanged?.Invoke($"Stats: raw {raw}/s, sent {sent}/s, total {totalRaw}/{totalSent}, clicks {clicks}, keys {keys}");
     }
 
+    private void EdgeMonitorLoop()
+    {
+        while (_running)
+        {
+            try
+            {
+                string? reachedEdge;
+                Point pos;
+                lock (_gate)
+                {
+                    pos = Cursor.Position;
+                    reachedEdge = !_remoteActive &&
+                        !_controlledByMac &&
+                        !_activationPending &&
+                        DateTime.UtcNow >= _suppressActivationUntil &&
+                        _stream != null &&
+                        _client?.Connected == true
+                            ? ReachedConfiguredEdge(pos.X, pos.Y)
+                            : null;
+                    if (reachedEdge != null) _activationPending = true;
+                }
+
+                if (reachedEdge != null)
+                {
+                    _uiThread?.BeginInvoke((MethodInvoker)(() => ActivateRemote(pos.X, pos.Y, reachedEdge)));
+                    Thread.Sleep(120);
+                }
+                else
+                {
+                    Thread.Sleep(5);
+                }
+            }
+            catch
+            {
+                Thread.Sleep(50);
+            }
+        }
+    }
+
     private bool EdgeReached(int x, int y)
     {
-        var bounds = Screen.FromPoint(new Point(x, y)).Bounds;
-        return _edge switch
-        {
-            "right" => x >= bounds.Right - 2 && !PointInsideAnyScreen(new Point(bounds.Right + 1, y)),
-            "left" => x <= bounds.Left + 1 && !PointInsideAnyScreen(new Point(bounds.Left - 2, y)),
-            "top" => y <= bounds.Top + 1 && !PointInsideAnyScreen(new Point(x, bounds.Top - 2)),
-            "bottom" => y >= bounds.Bottom - 2 && !PointInsideAnyScreen(new Point(x, bounds.Bottom + 1)),
-            _ => false
-        };
+        return ReachedOuterEdge(x, y) == _edge;
+    }
+
+    private string? ReachedConfiguredEdge(int x, int y)
+    {
+        var screen = Screen.FromPoint(new Point(x, y));
+        var reached = ReachedOuterEdge(screen, x, y);
+        if (reached != _edge) return null;
+        return ArrangementAllowsExit(screen, reached) ? reached : null;
+    }
+
+    private static string? ReachedOuterEdge(int x, int y)
+    {
+        return ReachedOuterEdge(Screen.FromPoint(new Point(x, y)), x, y);
+    }
+
+    private static string? ReachedOuterEdge(Screen screen, int x, int y)
+    {
+        var bounds = screen.Bounds;
+        if (x >= bounds.Right - 2 && !PointInsideAnyScreen(new Point(bounds.Right + 1, y))) return "right";
+        if (x <= bounds.Left + 1 && !PointInsideAnyScreen(new Point(bounds.Left - 2, y))) return "left";
+        if (y <= bounds.Top + 1 && !PointInsideAnyScreen(new Point(x, bounds.Top - 2))) return "top";
+        if (y >= bounds.Bottom - 2 && !PointInsideAnyScreen(new Point(x, bounds.Bottom + 1))) return "bottom";
+        return null;
     }
 
     private static bool PointInsideAnyScreen(Point point)
     {
         return Screen.AllScreens.Any(screen => screen.Bounds.Contains(point));
     }
+
+    private bool ArrangementAllowsExit(Screen screen, string edge)
+    {
+        var windowsDisplays = Screen.AllScreens.Select(ScreenDisplayBox).ToList();
+        var sourceDisplay = ScreenDisplayBox(screen);
+        if (_remoteDisplays.Count == 0)
+        {
+            DebugLog($"arrangement fallback no-remote-displays edge={edge}");
+            return true;
+        }
+        var boxes = ArrangementBoxes(windowsDisplays, _remoteDisplays, _machineOffsets);
+        var source = boxes.FirstOrDefault(box =>
+            box.Machine == "windows" &&
+            box.Name == sourceDisplay.Name &&
+            box.NativeBounds == sourceDisplay.Bounds
+        );
+        if (source == null)
+        {
+            DebugLog($"arrangement fallback no-source-match edge={edge} screen={sourceDisplay.Name}");
+            return true;
+        }
+
+        var allowed = boxes.Any(box =>
+            box.Machine == "mac" &&
+            EdgeCandidate(box.VirtualBounds, edge, source.VirtualBounds)
+        );
+        if (!allowed)
+        {
+            var hasAnyAdjacent = boxes.Any(box =>
+                box.Machine == "mac" &&
+                HasAnyAdjacentEdge(box.VirtualBounds, source.VirtualBounds)
+            );
+            if (!hasAnyAdjacent)
+            {
+                DebugLog($"arrangement fallback invalid-adjacency edge={edge} screen={sourceDisplay.Name} macDisplays={_remoteDisplays.Count}");
+                return true;
+            }
+            DebugLog($"arrangement blocked edge={edge} screen={sourceDisplay.Name} macDisplays={_remoteDisplays.Count}");
+        }
+        return allowed;
+    }
+
+    private static DisplayBox ScreenDisplayBox(Screen screen)
+    {
+        return new DisplayBox(ScreenName(screen), screen.Bounds, screen.Primary);
+    }
+
+    private static List<HostArrangementBox> ArrangementBoxes(
+        IReadOnlyList<DisplayBox> windowsDisplays,
+        IReadOnlyList<DisplayBox> macDisplays,
+        IReadOnlyDictionary<string, PointF> machineOffsets
+    )
+    {
+        var windowsWidth = GroupWidth(windowsDisplays, fallback: 2560);
+        var boxes = new List<HostArrangementBox>();
+        boxes.AddRange(DefaultFrames(macDisplays, "mac", 0));
+        boxes.AddRange(DefaultFrames(windowsDisplays, "windows", -(windowsWidth + 220)));
+        return boxes.Select(box => ApplyMachineOffset(box, machineOffsets)).ToList();
+    }
+
+    private static HostArrangementBox ApplyMachineOffset(
+        HostArrangementBox box,
+        IReadOnlyDictionary<string, PointF> machineOffsets
+    )
+    {
+        if (!machineOffsets.TryGetValue(box.Machine, out var offset)) return box;
+        return box with
+        {
+            VirtualBounds = new RectangleF(
+                box.VirtualBounds.Left + offset.X,
+                box.VirtualBounds.Top - offset.Y,
+                box.VirtualBounds.Width,
+                box.VirtualBounds.Height
+            )
+        };
+    }
+
+    private static IEnumerable<HostArrangementBox> DefaultFrames(
+        IReadOnlyList<DisplayBox> displays,
+        string machine,
+        float xOffset
+    )
+    {
+        if (displays.Count == 0) yield break;
+
+        var union = displays.Skip(1).Aggregate(displays[0].Bounds, (acc, display) => Rectangle.Union(acc, display.Bounds));
+        foreach (var display in displays)
+        {
+            var frame = new RectangleF(
+                display.Bounds.Left - union.Left + xOffset,
+                display.Bounds.Top - union.Top,
+                display.Bounds.Width,
+                display.Bounds.Height
+            );
+            yield return new HostArrangementBox(machine, display.Name, display.Bounds, frame);
+        }
+    }
+
+    private static float GroupWidth(IReadOnlyList<DisplayBox> displays, float fallback)
+    {
+        if (displays.Count == 0) return fallback;
+        return displays.Skip(1).Aggregate(displays[0].Bounds, (acc, display) => Rectangle.Union(acc, display.Bounds)).Width;
+    }
+
+    private static bool EdgeCandidate(RectangleF target, string edge, RectangleF source)
+    {
+        const float adjacencyTolerance = 24f;
+        return edge switch
+        {
+            "left" => Math.Abs(source.Left - target.Right) <= adjacencyTolerance &&
+                RangesOverlap(source.Top, source.Bottom, target.Top, target.Bottom),
+            "right" => Math.Abs(target.Left - source.Right) <= adjacencyTolerance &&
+                RangesOverlap(source.Top, source.Bottom, target.Top, target.Bottom),
+            "top" => Math.Abs(source.Top - target.Bottom) <= adjacencyTolerance &&
+                RangesOverlap(source.Left, source.Right, target.Left, target.Right),
+            "bottom" => Math.Abs(target.Top - source.Bottom) <= adjacencyTolerance &&
+                RangesOverlap(source.Left, source.Right, target.Left, target.Right),
+            _ => false
+        };
+    }
+
+    private static bool HasAnyAdjacentEdge(RectangleF target, RectangleF source)
+    {
+        return EdgeCandidate(target, "left", source) ||
+            EdgeCandidate(target, "right", source) ||
+            EdgeCandidate(target, "top", source) ||
+            EdgeCandidate(target, "bottom", source);
+    }
+
+    private static bool RangesOverlap(float aMin, float aMax, float bMin, float bMax)
+    {
+        return Math.Min(aMax, bMax) - Math.Max(aMin, bMin) > 1f;
+    }
+
+    private sealed record HostArrangementBox(
+        string Machine,
+        string Name,
+        Rectangle NativeBounds,
+        RectangleF VirtualBounds
+    );
 
     private void PinToEdge(bool force = false, double? xRatio = null, double? yRatio = null)
     {
@@ -1593,7 +2098,7 @@ public sealed class PortalHost
         {
             pos.Y = bounds.Top + (int)Math.Round((bounds.Height - 1) * yRatio.Value);
         }
-        pos = _edge switch
+        pos = _activeEdge switch
         {
             "right" => new Point(bounds.Right - 3, pos.Y),
             "left" => new Point(bounds.Left + 2, pos.Y),
@@ -1609,17 +2114,29 @@ public sealed class PortalHost
         _lastPos = pos;
     }
 
-    private void ActivateRemote(int x, int y)
+    private void ActivateRemote(int x, int y, string edge)
     {
-        if (_remoteActive || _stream == null || _client?.Connected != true) return;
+        if (_remoteActive || _controlledByMac || _stream == null || _client?.Connected != true)
+        {
+            lock (_gate) _activationPending = false;
+            return;
+        }
+        if (!EnableRemoteCapture())
+        {
+            lock (_gate) _activationPending = false;
+            return;
+        }
+        _activeEdge = edge;
         var screen = Screen.FromPoint(new Point(x, y));
         var bounds = screen.Bounds;
         var xRatio = bounds.Width <= 1 ? 0.5 : Math.Clamp((double)(x - bounds.Left) / bounds.Width, 0.0, 1.0);
         var yRatio = bounds.Height <= 1 ? 0.5 : Math.Clamp((double)(y - bounds.Top) / bounds.Height, 0.0, 1.0);
         _activeScreenBounds = bounds;
         _remoteActive = true;
+        _activationPending = false;
         _lastPos = new Point(x, y);
-        Send(new { type = "activate", edge = _edge, xRatio, yRatio, screen = ScreenPayload(screen) });
+        DebugLog($"remote active edge={_activeEdge} x={x} y={y}");
+        Send(new { type = "activate", edge = _activeEdge, xRatio, yRatio, screen = ScreenPayload(screen) });
         PinToEdge(force: true);
         StatusChanged?.Invoke("Mac control");
     }
@@ -1629,11 +2146,161 @@ public sealed class PortalHost
         lock (_gate)
         {
             _remoteActive = false;
+            _activationPending = false;
+            _suppressActivationUntil = DateTime.UtcNow.AddMilliseconds(350);
             _lastPos = null;
             PinToEdge(force: true, xRatio: xRatio, yRatio: yRatio);
             _activeScreenBounds = Rectangle.Empty;
+            _activeEdge = _edge;
         }
+        DisableRemoteCapture();
+        DebugLog("windows control");
         StatusChanged?.Invoke("Windows control");
+    }
+
+    private void ActivateFromMac(string edge, double xRatio, double yRatio, DisplayBox? sourceDisplay)
+    {
+        if (_remoteActive) return;
+
+        var targetScreen = ResolveWindowsTargetScreen(edge, sourceDisplay);
+        var bounds = targetScreen.Bounds;
+        var entryPoint = EntryPoint(bounds, edge, xRatio, yRatio);
+        _controlledByMac = true;
+        _targetReturnEdge = OppositeEdge(edge);
+        _targetScreenBounds = bounds;
+        _suppressActivationUntil = DateTime.UtcNow.AddMilliseconds(350);
+        Cursor.Position = entryPoint;
+        DebugLog($"windows target active edge={edge} return={_targetReturnEdge} x={entryPoint.X} y={entryPoint.Y}");
+        StatusChanged?.Invoke("Controlled from Mac");
+    }
+
+    private Screen ResolveWindowsTargetScreen(string edge, DisplayBox? sourceDisplay)
+    {
+        var screens = Screen.AllScreens;
+        if (screens.Length == 1) return screens[0];
+        if (sourceDisplay == null || _remoteDisplays.Count == 0) return screens.FirstOrDefault(screen => screen.Primary) ?? screens[0];
+
+        var localDisplays = screens.Select(ScreenDisplayBox).ToList();
+        var boxes = ArrangementBoxes(localDisplays, _remoteDisplays, _machineOffsets);
+        var source = boxes.FirstOrDefault(box =>
+            box.Machine == "mac" &&
+            box.Name == sourceDisplay.Name &&
+            box.NativeBounds == sourceDisplay.Bounds
+        );
+        if (source == null) return screens.FirstOrDefault(screen => screen.Primary) ?? screens[0];
+
+        var target = boxes
+            .Where(box => box.Machine == "windows" && EdgeCandidate(box.VirtualBounds, edge, source.VirtualBounds))
+            .OrderBy(box => box.NativeBounds.Width * box.NativeBounds.Height)
+            .LastOrDefault();
+        if (target == null) return screens.FirstOrDefault(screen => screen.Primary) ?? screens[0];
+
+        return screens.FirstOrDefault(screen =>
+            ScreenName(screen) == target.Name &&
+            screen.Bounds == target.NativeBounds
+        ) ?? screens.FirstOrDefault(screen => screen.Primary) ?? screens[0];
+    }
+
+    private static Point EntryPoint(Rectangle bounds, string edge, double xRatio, double yRatio)
+    {
+        const int inset = 24;
+        return edge switch
+        {
+            "left" => new Point(bounds.Left + inset, bounds.Top + (int)Math.Round((bounds.Height - 1) * yRatio)),
+            "right" => new Point(bounds.Right - inset, bounds.Top + (int)Math.Round((bounds.Height - 1) * yRatio)),
+            "top" => new Point(bounds.Left + (int)Math.Round((bounds.Width - 1) * xRatio), bounds.Top + inset),
+            "bottom" => new Point(bounds.Left + (int)Math.Round((bounds.Width - 1) * xRatio), bounds.Bottom - inset),
+            _ => new Point(bounds.Left + inset, bounds.Top + inset)
+        };
+    }
+
+    private static string OppositeEdge(string edge) => edge switch
+    {
+        "left" => "right",
+        "right" => "left",
+        "top" => "bottom",
+        "bottom" => "top",
+        _ => edge
+    };
+
+    private void ApplyRemoteMove(int dx, int dy)
+    {
+        if (!_controlledByMac) return;
+        var bounds = _targetScreenBounds.IsEmpty ? Screen.FromPoint(Cursor.Position).Bounds : _targetScreenBounds;
+        var current = Cursor.Position;
+        var next = new Point(
+            Math.Clamp(current.X + dx, bounds.Left, bounds.Right - 1),
+            Math.Clamp(current.Y + dy, bounds.Top, bounds.Bottom - 1)
+        );
+        Cursor.Position = next;
+        if (TargetReachedReturnEdge(next, bounds, _targetReturnEdge))
+        {
+            var xRatio = bounds.Width <= 1 ? 0.5 : Math.Clamp((double)(next.X - bounds.Left) / bounds.Width, 0.0, 1.0);
+            var yRatio = bounds.Height <= 1 ? 0.5 : Math.Clamp((double)(next.Y - bounds.Top) / bounds.Height, 0.0, 1.0);
+            _controlledByMac = false;
+            _targetScreenBounds = Rectangle.Empty;
+            DebugLog($"release to mac edge={_targetReturnEdge} x={next.X} y={next.Y}");
+            Send(new { type = "release", edge = _targetReturnEdge, xRatio, yRatio });
+            StatusChanged?.Invoke("Windows control");
+        }
+    }
+
+    private static bool TargetReachedReturnEdge(Point point, Rectangle bounds, string edge)
+    {
+        return edge switch
+        {
+            "left" => point.X <= bounds.Left + 1,
+            "right" => point.X >= bounds.Right - 2,
+            "top" => point.Y <= bounds.Top + 1,
+            "bottom" => point.Y >= bounds.Bottom - 2,
+            _ => false
+        };
+    }
+
+    private static void InjectMouseButton(string button, bool down)
+    {
+        var flags = button switch
+        {
+            "left" => down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP,
+            "right" => down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP,
+            "middle" => down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP,
+            "back" => down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
+            "forward" => down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP,
+            _ => 0u
+        };
+        if (flags == 0) return;
+        var data = button switch
+        {
+            "back" => XBUTTON1,
+            "forward" => XBUTTON2,
+            _ => 0
+        };
+        var inputs = new[] { INPUT.Mouse(flags, data, 0, 0) };
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+    }
+
+    private static void InjectScroll(int dx, int dy)
+    {
+        var count = (dx != 0 && dy != 0) ? 2 : 1;
+        var inputs = new INPUT[2];
+        var index = 0;
+        if (dy != 0)
+        {
+            inputs[index++] = INPUT.Mouse(MOUSEEVENTF_WHEEL, dy * 120, 0, 0);
+        }
+        if (dx != 0)
+        {
+            inputs[index++] = INPUT.Mouse(MOUSEEVENTF_HWHEEL, dx * 120, 0, 0);
+        }
+        SendInput((uint)count, inputs, Marshal.SizeOf<INPUT>());
+    }
+
+    private static void InjectKey(string name, bool down)
+    {
+        if (!VirtualKey(name, out var vk)) return;
+        var flags = down ? 0u : KEYEVENTF_KEYUP;
+        var inputs = new[] { INPUT.Keyboard(vk, 0, flags) };
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
     }
 
     private IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1649,11 +2316,6 @@ public sealed class PortalHost
         {
             if (!_remoteActive)
             {
-                if (_stream != null && _client?.Connected == true && message == WM_MOUSEMOVE && EdgeReached(x, y))
-                {
-                    ActivateRemote(x, y);
-                    return 1;
-                }
                 _lastPos = new Point(x, y);
                 return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
             }
@@ -1718,6 +2380,7 @@ public sealed class PortalHost
             if (_remoteActive)
             {
                 var name = KeyName(info.vkCode);
+                DebugLog($"key hook remote vk={info.vkCode} name={name ?? "-"} down={down} up={up}");
                 if (name != null)
                 {
                     var text = down ? KeyboardText.FromKey(info.vkCode, info.scanCode) : null;
@@ -1735,6 +2398,7 @@ public sealed class PortalHost
                         alt = IsKeyDown(0x12),
                         caps = IsKeyToggled(0x14)
                     });
+                    DebugLog($"key sent name={name} down={down} text={text ?? "-"}");
                     if (down) _keys++;
                     PublishStatsIfNeeded();
                 }
@@ -1746,20 +2410,84 @@ public sealed class PortalHost
 
     private void InstallHooks()
     {
-        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
-        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, GetModuleHandle(null), 0);
-        if (_mouseHook == IntPtr.Zero || _keyboardHook == IntPtr.Zero)
+        if (_mouseHook != IntPtr.Zero && _keyboardHook != IntPtr.Zero) return;
+        InstallMouseHook();
+        if (!InstallKeyboardHook())
         {
             throw new InvalidOperationException("Could not install input hooks. Run as Administrator.");
         }
     }
 
+    private void InstallMouseHook()
+    {
+        if (_mouseHook != IntPtr.Zero) return;
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
+        if (_mouseHook == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("Could not install mouse hook. Run as Administrator.");
+        }
+    }
+
+    private bool InstallKeyboardHook()
+    {
+        if (_keyboardHook != IntPtr.Zero) return true;
+        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, GetModuleHandle(null), 0);
+        if (_keyboardHook != IntPtr.Zero)
+        {
+            DebugLog("keyboard hook installed");
+            return true;
+        }
+        var error = Marshal.GetLastWin32Error();
+        DebugLog($"keyboard hook failed error={error}");
+        StatusChanged?.Invoke("Could not install keyboard hook. Run as Administrator.");
+        return false;
+    }
+
+    private bool EnableRemoteCapture()
+    {
+        try
+        {
+            InstallMouseHook();
+            if (!InstallKeyboardHook()) return false;
+            _rawMousePump ??= new RawMousePump(HandleRawMouseDelta);
+            _rawMousePump.Start();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            StatusChanged?.Invoke(ex.Message);
+            DisableRemoteCapture();
+            return false;
+        }
+    }
+
+    private void DisableRemoteCapture()
+    {
+        UninstallMouseHook();
+        _rawMousePump?.Dispose();
+        _rawMousePump = null;
+    }
+
     private void UninstallHooks()
     {
-        if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
+        UninstallMouseHook();
         if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
-        _mouseHook = IntPtr.Zero;
         _keyboardHook = IntPtr.Zero;
+    }
+
+    private void UninstallMouseHook()
+    {
+        if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
+        _mouseHook = IntPtr.Zero;
+    }
+
+    private static void DebugLog(string message)
+    {
+        try
+        {
+            File.AppendAllText(InputLogPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        }
+        catch { }
     }
 
     private static short HighWordSigned(uint value) => unchecked((short)((value >> 16) & 0xffff));
@@ -1784,6 +2512,32 @@ public sealed class PortalHost
             0xBE => ".", 0xBF => "/", 0xC0 => "`", 0xDB => "[", 0xDC => "\\",
             0xDD => "]", 0xDE => "'", _ => null
         };
+    }
+
+    private static bool VirtualKey(string name, out ushort vk)
+    {
+        vk = name switch
+        {
+            "a" => 0x41, "b" => 0x42, "c" => 0x43, "d" => 0x44, "e" => 0x45, "f" => 0x46,
+            "g" => 0x47, "h" => 0x48, "i" => 0x49, "j" => 0x4A, "k" => 0x4B, "l" => 0x4C,
+            "m" => 0x4D, "n" => 0x4E, "o" => 0x4F, "p" => 0x50, "q" => 0x51, "r" => 0x52,
+            "s" => 0x53, "t" => 0x54, "u" => 0x55, "v" => 0x56, "w" => 0x57, "x" => 0x58,
+            "y" => 0x59, "z" => 0x5A,
+            "0" => 0x30, "1" => 0x31, "2" => 0x32, "3" => 0x33, "4" => 0x34,
+            "5" => 0x35, "6" => 0x36, "7" => 0x37, "8" => 0x38, "9" => 0x39,
+            "backspace" => 0x08, "tab" => 0x09, "enter" => 0x0D, "escape" => 0x1B,
+            "space" => 0x20, "page_up" => 0x21, "page_down" => 0x22, "end" => 0x23,
+            "home" => 0x24, "left" => 0x25, "up" => 0x26, "right" => 0x27,
+            "down" => 0x28, "delete" => 0x2E, "shift" => 0x10, "right_shift" => 0xA1,
+            "ctrl" => 0x11, "right_ctrl" => 0xA3, "alt" => 0x12, "right_alt" => 0xA5,
+            "caps_lock" => 0x14, "cmd" => 0x5B, "f1" => 0x70, "f2" => 0x71,
+            "f3" => 0x72, "f4" => 0x73, "f5" => 0x74, "f6" => 0x75, "f7" => 0x76,
+            "f8" => 0x77, "f9" => 0x78, "f10" => 0x79, "f11" => 0x7A, "f12" => 0x7B,
+            ";" => 0xBA, "=" => 0xBB, "," => 0xBC, "-" => 0xBD, "." => 0xBE,
+            "/" => 0xBF, "`" => 0xC0, "[" => 0xDB, "\\" => 0xDC, "]" => 0xDD, "'" => 0xDE,
+            _ => 0
+        };
+        return vk != 0;
     }
 
     private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -1812,6 +2566,92 @@ public sealed class PortalHost
         public IntPtr dwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public uint type;
+        public INPUTUNION U;
+
+        public static INPUT Mouse(uint flags, int mouseData, uint time, nuint extraInfo)
+        {
+            return new INPUT
+            {
+                type = 0,
+                U = new INPUTUNION
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dx = 0,
+                        dy = 0,
+                        mouseData = mouseData,
+                        dwFlags = flags,
+                        time = time,
+                        dwExtraInfo = extraInfo
+                    }
+                }
+            };
+        }
+
+        public static INPUT Keyboard(ushort vk, ushort scan, uint flags)
+        {
+            return new INPUT
+            {
+                type = 1,
+                U = new INPUTUNION
+                {
+                    ki = new KEYBDINPUT
+                    {
+                        wVk = vk,
+                        wScan = scan,
+                        dwFlags = flags,
+                        time = 0,
+                        dwExtraInfo = 0
+                    }
+                }
+            };
+        }
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct INPUTUNION
+    {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public int mouseData;
+        public uint dwFlags;
+        public uint time;
+        public nuint dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public nuint dwExtraInfo;
+    }
+
+    private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+    private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+    private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+    private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+    private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
+    private const uint MOUSEEVENTF_WHEEL = 0x0800;
+    private const uint MOUSEEVENTF_HWHEEL = 0x1000;
+    private const uint MOUSEEVENTF_XDOWN = 0x0080;
+    private const uint MOUSEEVENTF_XUP = 0x0100;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(int idHook, Delegate lpfn, IntPtr hMod, uint dwThreadId);
 
@@ -1823,6 +2663,13 @@ public sealed class PortalHost
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(
+        uint cInputs,
+        [MarshalAs(UnmanagedType.LPArray), In] INPUT[] pInputs,
+        int cbSize
+    );
 
     [DllImport("winmm.dll")]
     private static extern uint timeBeginPeriod(uint uPeriod);

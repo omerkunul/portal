@@ -2,13 +2,15 @@ param(
   [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Portal",
   [switch]$NoDesktopShortcut,
   [switch]$NoStartupShortcut,
-  [switch]$Launch
+  [switch]$Launch,
+  [switch]$NoLaunchTask
 )
 
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourceExe = Join-Path $scriptDir "PortalWindows.exe"
+$taskName = "PortalLaunch"
 
 if (-not (Test-Path $sourceExe)) {
   throw "PortalWindows.exe was not found next to install-portal.ps1"
@@ -24,6 +26,7 @@ Copy-Item -Force (Join-Path $scriptDir "uninstall-portal.ps1") (Join-Path $Insta
 
 $shell = New-Object -ComObject WScript.Shell
 $exePath = Join-Path $InstallDir "PortalWindows.exe"
+$startupShortcutPath = Join-Path ([Environment]::GetFolderPath("Startup")) "Portal.lnk"
 
 $programsDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Portal"
 New-Item -ItemType Directory -Force $programsDir | Out-Null
@@ -71,16 +74,70 @@ if (-not $NoDesktopShortcut) {
 }
 
 if (-not $NoStartupShortcut) {
-  $startupDir = [Environment]::GetFolderPath("Startup")
-  New-Shortcut `
-    -Path (Join-Path $startupDir "Portal.lnk") `
-    -Target $exePath `
-    -WorkingDirectory $InstallDir `
-    -Description "Start Portal when Windows signs in"
+  if ($NoLaunchTask) {
+    New-Shortcut `
+      -Path $startupShortcutPath `
+      -Target $exePath `
+      -WorkingDirectory $InstallDir `
+      -Description "Start Portal when Windows signs in"
+  } else {
+    Remove-Item -Force $startupShortcutPath -ErrorAction SilentlyContinue
+    Write-Host "Startup shortcut skipped because launch task is enabled."
+  }
+}
+
+function Install-LaunchTask {
+  param([string]$TargetExe)
+
+  $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $action = New-ScheduledTaskAction `
+    -Execute $TargetExe `
+    -WorkingDirectory (Split-Path -Parent $TargetExe)
+
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $principal = New-ScheduledTaskPrincipal `
+    -UserId $user `
+    -LogonType Interactive `
+    -RunLevel Highest
+
+  Register-ScheduledTask `
+    -TaskName $taskName `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal `
+    -Force | Out-Null
+}
+
+if (-not $NoLaunchTask) {
+  try {
+    Install-LaunchTask -TargetExe $exePath
+    Write-Host "Launch task:"
+    Write-Host "  $taskName"
+  } catch {
+    Write-Host "Launch task could not be installed:"
+    Write-Host "  $($_.Exception.Message)"
+  }
+} else {
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 if ($Launch) {
-  Start-Process -FilePath $exePath -WorkingDirectory $InstallDir
+  if (-not $NoLaunchTask) {
+    try {
+      schtasks.exe /Run /TN $taskName | Out-Null
+    } catch {
+      Write-Host "Launch task run failed:"
+      Write-Host "  $($_.Exception.Message)"
+      Write-Host "Open Portal from the Start Menu if this was a remote SSH install."
+    }
+  } else {
+    try {
+      Start-Process -FilePath $exePath -WorkingDirectory $InstallDir
+    } catch {
+      Write-Host "Direct launch failed:"
+      Write-Host "  $($_.Exception.Message)"
+    }
+  }
 }
 
 Write-Host "Portal installed:"
