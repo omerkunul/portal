@@ -139,13 +139,13 @@ Alternatively install the interactive restart task once:
 Then from the Mac you can restart the visible Windows app:
 
 ```bash
-./script/restart_windows_omerkunul.sh
+PORTAL_WIN_TARGET=user@windows-ip ./script/restart_windows_omerkunul.sh
 ```
 
 Or build and restart in one step:
 
 ```bash
-./script/build_and_restart_windows_omerkunul.sh
+PORTAL_WIN_TARGET=user@windows-ip ./script/build_and_restart_windows_omerkunul.sh
 ```
 
 You can also save the target:

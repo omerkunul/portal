@@ -16,6 +16,11 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Network")
             ]
+        ),
+        .testTarget(
+            name: "PortalMacTests",
+            dependencies: ["PortalMac"],
+            path: "Tests/PortalMacTests"
         )
     ]
 )

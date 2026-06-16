@@ -45,8 +45,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-SIGN_IDENTITY="${PORTAL_CODESIGN_IDENTITY:-${LANFLOW_CODESIGN_IDENTITY:-Apple Development: MER KNL (87TSD5X7AZ)}}"
-if /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -F "$SIGN_IDENTITY" >/dev/null; then
+SIGN_IDENTITY="${PORTAL_CODESIGN_IDENTITY:-${LANFLOW_CODESIGN_IDENTITY:-}}"
+if [[ -n "$SIGN_IDENTITY" ]] && /usr/bin/security find-identity -v -p codesigning | /usr/bin/grep -F "$SIGN_IDENTITY" >/dev/null; then
   /usr/bin/codesign --force --deep --options runtime --sign "$SIGN_IDENTITY" "$APP_DIR" >/dev/null
 else
   /usr/bin/codesign --force --deep --sign - "$APP_DIR" >/dev/null

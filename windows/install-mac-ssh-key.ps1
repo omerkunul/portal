@@ -1,6 +1,10 @@
 $ErrorActionPreference = "Stop"
 
-$key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINhLLVSuXW00h3cL38ZjOoLYnvNqJqtSQ7wcZboXJ1u8 omerkunul@gmail.com"
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$Key
+)
+
 $sshDir = Join-Path $env:USERPROFILE ".ssh"
 $authorizedKeys = Join-Path $sshDir "authorized_keys"
 $adminAuthorizedKeys = "C:\ProgramData\ssh\administrators_authorized_keys"

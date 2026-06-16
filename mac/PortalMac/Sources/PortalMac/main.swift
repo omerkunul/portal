@@ -723,1369 +723,6 @@ struct MotionSummary {
     var lostPackets = 0
 }
 
-final class MotionProbe {
-    private let lock = NSLock()
-    private let bucketNs: UInt64 = 33_333_333
-    private var samples = Array(repeating: MotionSample(), count: 180)
-    private var index = 0
-    private var bucketStartNs = DispatchTime.now().uptimeNanoseconds
-    private var lastPacketNs: UInt64?
-    private var lastSequence: Int?
-
-    func record(dx: Int, dy: Int, raw: Int, senderGapMs: Double = 0, sequence: Int? = nil) {
-        let now = DispatchTime.now().uptimeNanoseconds
-        lock.lock()
-        advance(to: now)
-        let gap = lastPacketNs.map { Double(now - $0) / 1_000_000.0 } ?? 0
-        if let sequence {
-            if let lastSequence, sequence > lastSequence + 1 {
-                samples[index].lostPackets += sequence - lastSequence - 1
-            }
-            lastSequence = sequence
-        }
-        samples[index].packets += 1
-        samples[index].raw += max(raw, 1)
-        samples[index].distance += abs(dx) + abs(dy)
-        samples[index].maxReceiveGapMs = max(samples[index].maxReceiveGapMs, gap)
-        samples[index].maxSenderGapMs = max(samples[index].maxSenderGapMs, senderGapMs)
-        lastPacketNs = now
-        lock.unlock()
-    }
-
-    func snapshot() -> [MotionSample] {
-        let now = DispatchTime.now().uptimeNanoseconds
-        lock.lock()
-        advance(to: now)
-        let next = (index + 1) % samples.count
-        let ordered = Array(samples[next...]) + Array(samples[..<next])
-        lock.unlock()
-        return ordered
-    }
-
-    func summary(sampleCount: Int = 30) -> MotionSummary {
-        let recent = snapshot().suffix(sampleCount)
-        return MotionSummary(
-            packets: recent.reduce(0) { $0 + $1.packets },
-            raw: recent.reduce(0) { $0 + $1.raw },
-            maxReceiveGapMs: recent.map(\.maxReceiveGapMs).max() ?? 0,
-            maxSenderGapMs: recent.map(\.maxSenderGapMs).max() ?? 0,
-            lostPackets: recent.reduce(0) { $0 + $1.lostPackets }
-        )
-    }
-
-    private func advance(to now: UInt64) {
-        guard now > bucketStartNs else { return }
-        var steps = Int((now - bucketStartNs) / bucketNs)
-        guard steps > 0 else { return }
-        if steps > samples.count {
-            steps = samples.count
-        }
-        for _ in 0..<steps {
-            index = (index + 1) % samples.count
-            samples[index] = MotionSample()
-            bucketStartNs += bucketNs
-        }
-        if now - bucketStartNs > bucketNs * UInt64(samples.count) {
-            bucketStartNs = now
-        }
-    }
-}
-
-final class MotionLogWriter {
-    private let probe: MotionProbe
-    private let url = URL(fileURLWithPath: "/tmp/portal-motion.log")
-    private var timer: Timer?
-
-    init(probe: MotionProbe) {
-        self.probe = probe
-        try? "time,pkt_per_s,raw_per_s,win_gap_ms,mac_gap_ms,lost\n".write(to: url, atomically: true, encoding: .utf8)
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.writeSample()
-        }
-    }
-
-    deinit {
-        timer?.invalidate()
-    }
-
-    private func writeSample() {
-        let summary = probe.summary()
-        let line = String(
-            format: "%@,%d,%d,%.1f,%.1f,%d\n",
-            isoTimestamp(),
-            summary.packets,
-            summary.raw,
-            summary.maxSenderGapMs,
-            summary.maxReceiveGapMs,
-            summary.lostPackets
-        )
-        guard let data = line.data(using: .utf8) else { return }
-        do {
-            let handle = try FileHandle(forWritingTo: url)
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            try handle.close()
-        } catch { }
-    }
-
-    private func isoTimestamp() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
-    }
-}
-
-final class MotionGraphView: NSView {
-    var probe: MotionProbe?
-    private var timer: Timer?
-    private var cachedSamples: [MotionSample] = []
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.masksToBounds = true
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.cachedSamples = self.probe?.snapshot() ?? []
-            self.needsDisplay = true
-        }
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    deinit {
-        timer?.invalidate()
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: 460, height: 150)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor(hex: 0x121317).setFill()
-        bounds.fill()
-
-        let plot = bounds.insetBy(dx: 10, dy: 24)
-        NSColor(hex: 0x414755, alpha: 0.5).setStroke()
-        for step in 0...3 {
-            let y = plot.minY + plot.height * CGFloat(step) / 3.0
-            let path = NSBezierPath()
-            path.move(to: CGPoint(x: plot.minX, y: y))
-            path.line(to: CGPoint(x: plot.maxX, y: y))
-            path.stroke()
-        }
-
-        guard !cachedSamples.isEmpty else {
-            return
-        }
-
-        let maxDistance = max(8, cachedSamples.map(\.distance).max() ?? 8)
-        let barWidth = max(1, plot.width / CGFloat(cachedSamples.count))
-
-        for (i, sample) in cachedSamples.enumerated() {
-            let x = plot.minX + CGFloat(i) * barWidth
-            let ratio = min(1.0, CGFloat(sample.distance) / CGFloat(maxDistance))
-            let height = max(sample.packets > 0 ? 2 : 0, plot.height * ratio)
-            let rect = NSRect(x: x, y: plot.minY, width: max(1, barWidth - 1), height: height)
-            if sample.maxSenderGapMs > 80 {
-                NSColor.systemRed.withAlphaComponent(0.9).setFill()
-            } else if sample.maxReceiveGapMs > 80 || sample.lostPackets > 0 {
-                NSColor.systemOrange.withAlphaComponent(0.9).setFill()
-            } else if sample.maxSenderGapMs > 35 || sample.maxReceiveGapMs > 35 {
-                NSColor.systemYellow.withAlphaComponent(0.9).setFill()
-            } else {
-                NSColor(hex: 0x32d74b, alpha: 0.82).setFill()
-            }
-            rect.fill()
-        }
-    }
-}
-
-struct DisplayInfo {
-    let name: String
-    let frame: CGRect
-    let isPrimary: Bool
-}
-
-struct ArrangementItem {
-    let id: String
-    let machine: String
-    let index: Int
-    let name: String
-    let nativeFrame: CGRect
-    let virtualFrame: CGRect
-    let isPrimary: Bool
-}
-
-final class PortalUIModel: ObservableObject {
-    @Published var port = "45877"
-    @Published var edge = Edge.right
-    @Published var isRunning = false
-    @Published var isStarting = false
-    @Published var status = "Stopped"
-    @Published var ip = "checking..."
-    @Published var accessibility = "checking..."
-    @Published var accessibilityOK = false
-    @Published var awdlEnabled = true
-    @Published var awdlText = "checking..."
-    @Published var awdlColor: Color = .secondary
-    @Published var stats = "Stats: idle"
-    @Published var arrangement = "checking..."
-    @Published var windowsSetupStatus = "Ready to prepare a Windows host"
-    @Published var windowsInstallerURL = ""
-    @Published var windowsInstallCommand = ""
-    @Published var windowsHosts: [WindowsHostCandidate] = []
-    @Published var isScanningWindows = false
-    @Published var isServingInstaller = false
-}
-
-struct WindowsHostCandidate: Identifiable, Hashable {
-    let id = UUID()
-    let ip: String
-    let ports: [String]
-    let name: String
-
-    var summary: String {
-        let portText = ports.isEmpty ? "no install ports" : ports.joined(separator: ", ")
-        return name.isEmpty ? portText : "\(portText) · \(name)"
-    }
-}
-
-extension Color {
-    static var portalOrange: Color { Color(nsColor: .systemOrange) }
-    static var portalGreen: Color { Color(nsColor: .systemGreen) }
-    static var portalBackground: Color { Color(nsColor: NSColor(hex: 0x121317)) }
-    static var portalSurfaceLow: Color { Color(nsColor: NSColor(hex: 0x1a1b1f)) }
-    static var portalSurface: Color { Color(nsColor: NSColor(hex: 0x1e1f23)) }
-    static var portalSurfaceHigh: Color { Color(nsColor: NSColor(hex: 0x292a2e)) }
-    static var portalBorder: Color { Color(nsColor: NSColor(hex: 0x414755)) }
-    static var portalText: Color { Color(nsColor: NSColor(hex: 0xe3e2e7)) }
-    static var portalMuted: Color { Color(nsColor: NSColor(hex: 0xc1c6d7)).opacity(0.72) }
-    static var portalPrimary: Color { Color(nsColor: NSColor(hex: 0x007aff)) }
-    static var portalSuccess: Color { Color(nsColor: NSColor(hex: 0x32d74b)) }
-    static var portalDanger: Color { Color(nsColor: NSColor(hex: 0xff453a)) }
-}
-
-extension NSColor {
-    convenience init(hex: UInt32, alpha: CGFloat = 1) {
-        self.init(
-            calibratedRed: CGFloat((hex >> 16) & 0xff) / 255,
-            green: CGFloat((hex >> 8) & 0xff) / 255,
-            blue: CGFloat(hex & 0xff) / 255,
-            alpha: alpha
-        )
-    }
-}
-
-private enum PortalTab: String, CaseIterable {
-    case control = "Control"
-    case setup = "Windows Setup"
-    case arrange = "Arrange"
-    case settings = "Settings"
-}
-
-struct MotionGraphRepresentable: NSViewRepresentable {
-    let view: MotionGraphView
-
-    func makeNSView(context: Context) -> MotionGraphView {
-        view
-    }
-
-    func updateNSView(_ nsView: MotionGraphView, context: Context) {}
-}
-
-struct DisplayArrangementRepresentable: NSViewRepresentable {
-    let view: DisplayArrangementView
-
-    func makeNSView(context: Context) -> DisplayArrangementView {
-        view
-    }
-
-    func updateNSView(_ nsView: DisplayArrangementView, context: Context) {
-        nsView.needsDisplay = true
-    }
-}
-
-struct PortalRootView: View {
-    @ObservedObject var model: PortalUIModel
-    @State private var selectedTab: PortalTab = .control
-    @AppStorage("portal.clipboardSync.enabled") private var clipboardSyncEnabled = true
-    @AppStorage("portal.autoStart.enabled") private var autoStartEnabled = true
-    @AppStorage("portal.autoUpdate.enabled") private var autoUpdateEnabled = false
-    @AppStorage("portal.autoScan.enabled") private var autoScanEnabled = true
-    @AppStorage("portal.reconnect.enabled") private var reconnectEnabled = true
-    @AppStorage("portal.notifications.enabled") private var notificationsEnabled = true
-    @AppStorage("portal.launchAtLogin.enabled") private var launchAtLoginEnabled = false
-    @AppStorage("portal.debugLogs.enabled") private var debugLogsEnabled = false
-    let motionGraph: MotionGraphView
-    let arrangementView: DisplayArrangementView
-    let toggleServer: () -> Void
-    let toggleAwdl: (Bool) -> Void
-    let openAccessibility: () -> Void
-    let resetArrangement: () -> Void
-    let scanWindowsHosts: () -> Void
-    let toggleInstallerServer: () -> Void
-    let copyWindowsInstallCommand: () -> Void
-
-    var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-                .frame(width: 200)
-
-            VStack(spacing: 0) {
-                header
-
-                pageContainer {
-                    switch selectedTab {
-                    case .control:
-                        controlView
-                    case .setup:
-                        windowsSetupTab
-                    case .arrange:
-                        arrangementTab
-                    case .settings:
-                        settingsTab
-                    }
-                }
-
-                statsPanel
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .background(Color.portalBackground)
-        .frame(width: 1180, height: 780)
-        .preferredColorScheme(.dark)
-    }
-
-    @ViewBuilder
-    private func pageContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            content()
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
-                .padding(.bottom, 24)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color.portalBackground)
-    }
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Portal")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(Color.portalText)
-                Spacer()
-            }
-            .padding(.leading, 86)
-            .padding(.trailing, 16)
-            .frame(height: 56)
-
-            VStack(spacing: 8) {
-                ForEach(PortalTab.allCases, id: \.self) { tab in
-                    sidebarButton(tab)
-                }
-            }
-            .padding(.top, 64)
-            .padding(.horizontal, 14)
-
-            Spacer()
-
-            VStack(alignment: .leading, spacing: 12) {
-                sidebarFooter("Support", systemImage: "questionmark.circle")
-                sidebarFooter("Logs", systemImage: "terminal")
-            }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 22)
-        }
-        .frame(maxHeight: .infinity)
-        .background(Color.portalSurfaceLow.opacity(0.92))
-    }
-
-    private func sidebarButton(_ tab: PortalTab) -> some View {
-        Button {
-            selectedTab = tab
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: sidebarIcon(for: tab))
-                    .font(.system(size: 14, weight: .semibold))
-                    .frame(width: 18)
-                Text(tab.rawValue)
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-            }
-            .foregroundStyle(selectedTab == tab ? Color.portalText : Color.portalMuted)
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: 36)
-            .background(selectedTab == tab ? Color.portalSurfaceHigh : Color.clear)
-            .contentShape(RoundedRectangle(cornerRadius: 8))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func sidebarIcon(for tab: PortalTab) -> String {
-        switch tab {
-        case .control: return "computermouse"
-        case .setup: return "desktopcomputer.and.arrow.down"
-        case .arrange: return "square.grid.2x2"
-        case .settings: return "gearshape"
-        }
-    }
-
-    private func sidebarFooter(_ title: String, systemImage: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: systemImage)
-                .font(.system(size: 11))
-                .frame(width: 14)
-            Text(title)
-                .font(.system(size: 11, weight: .medium))
-        }
-        .foregroundStyle(Color.portalMuted)
-    }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Text(selectedTab.rawValue)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Color.portalText)
-
-            statusBadge
-
-            Spacer()
-
-            Button(action: toggleServer) {
-                HStack(spacing: 7) {
-                    Image(systemName: model.isRunning ? "stop.circle" : "play.circle")
-                    Text(model.isRunning ? "Stop" : (model.isStarting ? "Starting..." : "Start"))
-                }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(height: 28)
-                .padding(.horizontal, 13)
-                .background(model.isRunning ? Color.portalDanger.opacity(0.38) : Color.portalPrimary)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 7)
-                        .stroke(model.isRunning ? Color.portalDanger.opacity(0.55) : Color.portalPrimary.opacity(0.5), lineWidth: 1)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-            }
-            .buttonStyle(.plain)
-            .disabled(model.isStarting)
-        }
-        .frame(height: 56)
-        .padding(.horizontal, 24)
-        .background(Color.portalBackground)
-    }
-
-    private var statusBadge: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(model.isRunning ? Color.portalSuccess : Color.portalMuted)
-                .frame(width: 8, height: 8)
-            Text(model.status)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .lineLimit(1)
-        }
-        .foregroundStyle(model.isRunning ? Color.portalSuccess : Color.portalMuted)
-        .padding(.horizontal, 10)
-        .frame(height: 24)
-        .background((model.isRunning ? Color.portalSuccess : Color.portalMuted).opacity(0.12))
-        .overlay {
-            Capsule()
-                .stroke((model.isRunning ? Color.portalSuccess : Color.portalMuted).opacity(0.28), lineWidth: 1)
-        }
-        .clipShape(Capsule())
-    }
-
-    private var controlView: some View {
-        VStack(spacing: 18) {
-            HStack(alignment: .top, spacing: 18) {
-                PortalCard(title: "Network Configuration", systemImage: "network") {
-                    DataRow("Primary Port") {
-                        TextField("", text: $model.port)
-                            .textFieldStyle(.plain)
-                            .multilineTextAlignment(.trailing)
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Color(nsColor: NSColor(hex: 0xadc6ff)))
-                    }
-                    DataRow("Local IP") {
-                        Text(model.ip)
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Color.portalText)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    DataRow("Connection Status") {
-                        HStack(spacing: 5) {
-                            Image(systemName: model.isRunning ? "checkmark.circle" : "circle")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text(model.isRunning ? "Active" : "Idle")
-                                .font(.system(size: 12, weight: .semibold))
-                        }
-                        .foregroundStyle(model.isRunning ? Color.portalSuccess : Color.portalMuted)
-                    }
-                }
-
-                PortalCard(title: "System Permissions", systemImage: "lock.shield") {
-                    HStack(spacing: 12) {
-                        ZStack {
-                            Circle()
-                                .fill((model.accessibilityOK ? Color.portalSuccess : Color.portalOrange).opacity(0.18))
-                                .frame(width: 34, height: 34)
-                            Image(systemName: model.accessibilityOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .font(.system(size: 18, weight: .semibold))
-                                .foregroundStyle(model.accessibilityOK ? Color.portalSuccess : Color.portalOrange)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Accessibility Access")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(Color.portalText)
-                            Text(model.accessibilityOK ? "Granted & Active" : model.accessibility)
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(model.accessibilityOK ? Color.portalSuccess : Color.portalOrange)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                    }
-                    .padding(12)
-                    .background(Color.portalSurfaceHigh.opacity(0.68))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                    DataRow("AWDL (Low Latency)") {
-                        Toggle("", isOn: Binding(
-                            get: { model.awdlEnabled },
-                            set: { toggleAwdl($0) }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                    }
-
-                    Button(action: openAccessibility) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "arrow.up.forward.square")
-                            Text("Open Accessibility Settings")
-                        }
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 34)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.portalText)
-                    .background(Color.portalSurfaceLow)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(Color.portalBorder.opacity(0.48), lineWidth: 1)
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-                }
-            }
-
-            liveActivityCard
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private var arrangementTab: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                Picker("", selection: $model.edge) {
-                    ForEach(Edge.allCases, id: \.self) { edge in
-                        Text(edge.rawValue.capitalized).tag(edge)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 150)
-
-                Button("Reset", action: resetArrangement)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                Spacer()
-
-                Text(model.arrangement.replacingOccurrences(of: "\n", with: " · "))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color.portalMuted)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 44)
-            .background(Color.portalSurface)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            DisplayArrangementRepresentable(view: arrangementView)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.portalBorder.opacity(0.42), lineWidth: 1)
-                }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private var windowsSetupTab: some View {
-        VStack(spacing: 18) {
-            HStack(alignment: .top, spacing: 18) {
-                PortalCard(title: "Windows Installer", systemImage: "shippingbox") {
-                    DataRow("Status") {
-                        Text(model.windowsSetupStatus)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color.portalText)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.trailing)
-                    }
-
-                    DataRow("Installer URL") {
-                        Text(model.windowsInstallerURL.isEmpty ? "not serving" : model.windowsInstallerURL)
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(model.windowsInstallerURL.isEmpty ? Color.portalMuted : Color(nsColor: NSColor(hex: 0xadc6ff)))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-
-                    HStack(spacing: 10) {
-                        Button(action: toggleInstallerServer) {
-                            Label(model.isServingInstaller ? "Stop Installer" : "Serve Installer", systemImage: model.isServingInstaller ? "stop.circle" : "antenna.radiowaves.left.and.right")
-                                .font(.system(size: 12, weight: .semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 34)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.white)
-                        .background(model.isServingInstaller ? Color.portalDanger.opacity(0.42) : Color.portalPrimary)
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-
-                        Button(action: copyWindowsInstallCommand) {
-                            Label("Copy Command", systemImage: "doc.on.doc")
-                                .font(.system(size: 12, weight: .semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 34)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.portalText)
-                        .background(Color.portalSurfaceLow)
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 7)
-                                .stroke(Color.portalBorder.opacity(0.48), lineWidth: 1)
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
-                        .disabled(model.windowsInstallCommand.isEmpty)
-                    }
-
-                    Text(model.windowsInstallCommand.isEmpty ? "Start installer sharing, then paste the copied command into PowerShell on the Windows machine." : model.windowsInstallCommand)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.portalMuted)
-                        .lineLimit(3)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.portalSurfaceHigh.opacity(0.5))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                .frame(height: 258)
-
-                PortalCard(title: "Network Scan", systemImage: "network.badge.shield.half.filled") {
-                    networkScanPanel
-                }
-                .frame(height: 258)
-            }
-
-            PortalCard(title: "Setup Path", systemImage: "point.topleft.down.curvedto.point.bottomright.up") {
-                HStack(spacing: 12) {
-                    setupStep("1", "Find", "Scan LAN for the Windows host.")
-                    setupStep("2", "Install", "Serve the installer from this Mac.")
-                    setupStep("3", "Automate", "Enable SSH once for remote updates.")
-                }
-            }
-            .frame(height: 112)
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private var settingsTab: some View {
-        VStack(spacing: 18) {
-            HStack(alignment: .top, spacing: 18) {
-                PortalCard(title: "Sync", systemImage: "arrow.triangle.2.circlepath") {
-                    settingsToggle("Copy & Paste", "Sync text and images between Mac and Windows.", isOn: $clipboardSyncEnabled)
-                    settingsToggle("Auto Reconnect", "Keep the Windows host attached after sleep or network changes.", isOn: $reconnectEnabled)
-                    settingsToggle("Notifications", "Show setup and connection alerts.", isOn: $notificationsEnabled)
-                }
-                .frame(height: 184)
-
-                PortalCard(title: "Startup", systemImage: "power") {
-                    settingsToggle("Open at Login", "Start Portal when this Mac signs in.", isOn: $launchAtLoginEnabled)
-                    settingsToggle("Start Server", "Begin listening automatically when Portal opens.", isOn: $autoStartEnabled)
-                    settingsToggle("Auto Scan", "Refresh Windows host discovery when setup opens.", isOn: $autoScanEnabled)
-                }
-                .frame(height: 184)
-            }
-
-            HStack(alignment: .top, spacing: 18) {
-                PortalCard(title: "Maintenance", systemImage: "wrench.and.screwdriver") {
-                    settingsToggle("Auto Update", "Check for Windows host updates during setup.", isOn: $autoUpdateEnabled)
-                    settingsToggle("Debug Logs", "Write extra input and connection diagnostics.", isOn: $debugLogsEnabled)
-                    DataRow("Windows Package") {
-                        Text("Portal-Windows-installer.zip")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Color.portalMuted)
-                            .lineLimit(1)
-                    }
-                }
-                .frame(height: 184)
-
-                PortalCard(title: "Low Latency", systemImage: "speedometer") {
-                    DataRow("AWDL") {
-                        Toggle("", isOn: Binding(
-                            get: { model.awdlEnabled },
-                            set: { toggleAwdl($0) }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                    }
-                    DataRow("Accessibility") {
-                        Text(model.accessibilityOK ? "Granted" : "Required")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(model.accessibilityOK ? Color.portalSuccess : Color.portalOrange)
-                    }
-                    Button(action: openAccessibility) {
-                        Label("Open Accessibility", systemImage: "arrow.up.forward.square")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 34)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Color.portalText)
-                    .background(Color.portalSurfaceLow)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7)
-                            .stroke(Color.portalBorder.opacity(0.48), lineWidth: 1)
-                    }
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-                }
-                .frame(height: 184)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private func settingsToggle(_ title: String, _ detail: String, isOn: Binding<Bool>) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.portalText)
-                Text(detail)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.portalMuted)
-                    .lineLimit(1)
-            }
-            Spacer()
-            Toggle("", isOn: isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-        }
-        .padding(8)
-        .background(Color.portalSurfaceHigh.opacity(0.46))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var networkScanPanel: some View {
-        VStack(spacing: 12) {
-            Button(action: scanWindowsHosts) {
-                Label(model.isScanningWindows ? "Scanning..." : "Scan Network", systemImage: "dot.radiowaves.left.and.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 34)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .background(model.isScanningWindows ? Color.portalMuted.opacity(0.35) : Color.portalPrimary)
-            .clipShape(RoundedRectangle(cornerRadius: 7))
-            .disabled(model.isScanningWindows)
-
-            Group {
-                if model.windowsHosts.isEmpty {
-                    Text("No Windows candidates yet")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color.portalMuted)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(Array(model.windowsHosts.prefix(3))) { host in
-                            windowsHostRow(host)
-                        }
-
-                        if model.windowsHosts.count > 3 {
-                            Text("+ \(model.windowsHosts.count - 3) more hosts")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.portalMuted)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                }
-            }
-            .frame(height: 128)
-        }
-    }
-
-    private func windowsHostRow(_ host: WindowsHostCandidate) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: host.ports.contains("22") ? "checkmark.circle.fill" : "desktopcomputer")
-                .foregroundStyle(host.ports.contains("22") ? Color.portalSuccess : Color.portalOrange)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(host.ip)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color.portalText)
-                Text(host.summary)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.portalMuted)
-                    .lineLimit(1)
-            }
-            Spacer()
-        }
-        .padding(9)
-        .background(Color.portalSurfaceHigh.opacity(0.58))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func setupStep(_ number: String, _ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 9) {
-            Text(number)
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(.white)
-                .frame(width: 22, height: 22)
-                .background(Color.portalPrimary)
-                .clipShape(Circle())
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.portalText)
-                Text(detail)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.portalMuted)
-                    .lineLimit(2)
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var liveActivityCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("Live Activity", systemImage: "chart.bar.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.portalText)
-                Spacer()
-                Text(model.stats)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(Color.portalMuted)
-                    .lineLimit(1)
-            }
-
-            MotionGraphRepresentable(view: motionGraph)
-                .frame(height: 118)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .padding(16)
-        .background(Color.portalSurface)
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.portalBorder.opacity(0.34), lineWidth: 1)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-    }
-
-    private var statsPanel: some View {
-        EmptyView()
-    }
-}
-
-struct PortalCard<Content: View>: View {
-    let title: String
-    let systemImage: String
-    let content: Content
-
-    init(title: String, systemImage: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.systemImage = systemImage
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color.portalText)
-
-            Divider()
-                .overlay(Color.portalBorder.opacity(0.35))
-
-            content
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .background(Color.portalSurface)
-        .overlay {
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(Color.portalBorder.opacity(0.34), lineWidth: 1)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-    }
-}
-
-struct DataRow<Content: View>: View {
-    let title: String
-    let content: Content
-
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.portalMuted)
-            content
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-        .frame(height: 32)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.portalBorder.opacity(0.24))
-                .frame(height: 1)
-        }
-    }
-}
-
-final class DisplayArrangementView: NSView {
-    private struct ViewTransform {
-        let union: CGRect
-        let origin: CGPoint
-        let scale: CGFloat
-
-        var visibleRect: NSRect {
-            NSRect(
-                x: origin.x,
-                y: origin.y,
-                width: union.width * scale,
-                height: union.height * scale
-            )
-        }
-    }
-
-    private struct DragState {
-        let machine: String
-        let startPoint: CGPoint
-        let originalOffset: CGPoint
-        let transform: ViewTransform
-    }
-
-    private struct SnapMatch {
-        let sourceFrame: CGRect
-        let targetFrame: CGRect
-    }
-
-    private struct SnapResult {
-        let offset: CGPoint
-        let match: SnapMatch?
-    }
-
-    private let snapDistance: CGFloat = 48
-    private let adjacencyTolerance: CGFloat = 24
-    var macDisplays: [DisplayInfo] = [] {
-        didSet { needsDisplay = true }
-    }
-
-    var windowsDisplays: [DisplayInfo] = [] {
-        didSet { needsDisplay = true }
-    }
-
-    var machineOffsets: [String: CGPoint] = [:] {
-        didSet { needsDisplay = true }
-    }
-
-    var onOffsetsChanged: (([String: CGPoint]) -> Void)?
-
-    private var renderedRects: [(id: String, machine: String, rect: NSRect)] = []
-    private var dragState: DragState?
-    private var lastTransform: ViewTransform?
-    private var pinnedTransform: ViewTransform?
-    private var snapMatch: SnapMatch?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.masksToBounds = true
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: 900, height: 620)
-    }
-
-    func resetViewport() {
-        pinnedTransform = nil
-        snapMatch = nil
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor(hex: 0x121317).setFill()
-        bounds.fill()
-
-        let items = arrangementItems()
-        guard !items.isEmpty else {
-            drawText("No displays found", at: CGPoint(x: 16, y: bounds.midY), font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
-            return
-        }
-
-        let transform = dragState?.transform ?? pinnedTransform ?? makeTransform(for: items)
-        lastTransform = transform
-        pinnedTransform = transform
-
-        drawGrid(in: transform.visibleRect)
-        NSColor(hex: 0x414755, alpha: 0.45).setStroke()
-        NSBezierPath(rect: transform.visibleRect).stroke()
-        renderedRects = []
-
-        for item in items {
-            let rect = map(item.virtualFrame, transform: transform)
-            renderedRects.append((item.id, item.machine, rect))
-            let color = item.machine == "mac"
-                ? (item.isPrimary ? NSColor(hex: 0x007aff) : NSColor(hex: 0x32d74b))
-                : (item.isPrimary ? NSColor(hex: 0xff9f0a) : NSColor(hex: 0x5e5ce6))
-            color.withAlphaComponent(0.18).setFill()
-            rect.fill()
-            color.withAlphaComponent(0.95).setStroke()
-            let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
-            path.lineWidth = item.isPrimary ? 2.5 : 1.5
-            path.stroke()
-
-            let machineLabel = item.machine == "mac" ? "M" : "W"
-            let number = "\(machineLabel)\(item.index + 1)\(item.isPrimary ? "*" : "")"
-            drawCentered(number, in: rect, font: .boldSystemFont(ofSize: 22), color: .labelColor)
-
-            let label = "\(item.name)\n\(Int(item.nativeFrame.width))x\(Int(item.nativeFrame.height))"
-            let labelRect = NSRect(x: rect.minX + 5, y: rect.minY + 5, width: max(1, rect.width - 10), height: min(42, max(22, rect.height * 0.34)))
-            drawCentered(label, in: labelRect, font: .monospacedSystemFont(ofSize: 9, weight: .regular), color: NSColor(hex: 0xc1c6d7, alpha: 0.72))
-        }
-
-        if let snapMatch {
-            drawSnapMatch(snapMatch, transform: transform)
-        }
-    }
-
-    private func makeTransform(for items: [ArrangementItem]) -> ViewTransform {
-        let union = items.dropFirst().reduce(items[0].virtualFrame) { $0.union($1.virtualFrame) }
-        let drawing = bounds.insetBy(dx: 18, dy: 18)
-        let scale = max(0.0001, min(drawing.width / max(1, union.width), drawing.height / max(1, union.height)))
-        let drawnWidth = union.width * scale
-        let drawnHeight = union.height * scale
-        let origin = CGPoint(
-            x: drawing.midX - drawnWidth / 2,
-            y: drawing.midY - drawnHeight / 2
-        )
-        return ViewTransform(union: union, origin: origin, scale: scale)
-    }
-
-    func arrangementItems() -> [ArrangementItem] {
-        arrangementItems(offsets: machineOffsets)
-    }
-
-    private func arrangementItems(offsets: [String: CGPoint]) -> [ArrangementItem] {
-        let macDefaults = defaultFrames(for: macDisplays, machine: "mac", xOffset: 0)
-        let windowsDefaults = defaultFrames(for: windowsDisplays, machine: "windows", xOffset: -(windowsGroupWidth() + 220))
-        let defaults = macDefaults + windowsDefaults
-        return defaults.map { item in
-            let offset = offsets[item.machine] ?? .zero
-            guard offset != .zero else { return item }
-            return ArrangementItem(
-                id: item.id,
-                machine: item.machine,
-                index: item.index,
-                name: item.name,
-                nativeFrame: item.nativeFrame,
-                virtualFrame: item.virtualFrame.offsetBy(dx: offset.x, dy: offset.y),
-                isPrimary: item.isPrimary
-            )
-        }
-    }
-
-    private func defaultFrames(for displays: [DisplayInfo], machine: String, xOffset: CGFloat) -> [ArrangementItem] {
-        guard !displays.isEmpty else { return [] }
-        let union = displays.dropFirst().reduce(displays[0].frame) { $0.union($1.frame) }
-        return displays.enumerated().map { index, display in
-            let origin: CGPoint
-            origin = CGPoint(
-                x: display.frame.minX - union.minX + xOffset,
-                y: union.maxY - display.frame.maxY
-            )
-            return ArrangementItem(
-                id: displayId(machine: machine, display: display),
-                machine: machine,
-                index: index,
-                name: display.name,
-                nativeFrame: display.frame,
-                virtualFrame: CGRect(origin: origin, size: display.frame.size),
-                isPrimary: display.isPrimary
-            )
-        }
-    }
-
-    private func windowsGroupWidth() -> CGFloat {
-        guard !windowsDisplays.isEmpty else { return 1920 }
-        let union = windowsDisplays.dropFirst().reduce(windowsDisplays[0].frame) { $0.union($1.frame) }
-        return union.width
-    }
-
-    private func displayId(machine: String, display: DisplayInfo) -> String {
-        "\(machine)|\(display.name)|\(Int(display.frame.minX))|\(Int(display.frame.minY))|\(Int(display.frame.width))|\(Int(display.frame.height))"
-    }
-
-    private func map(_ frame: CGRect, transform: ViewTransform) -> NSRect {
-        NSRect(
-            x: transform.origin.x + (frame.minX - transform.union.minX) * transform.scale,
-            y: transform.origin.y + (frame.minY - transform.union.minY) * transform.scale,
-            width: max(8, frame.width * transform.scale),
-            height: max(8, frame.height * transform.scale)
-        )
-    }
-
-    private func drawSnapMatch(_ match: SnapMatch, transform: ViewTransform) {
-        let source = map(match.sourceFrame, transform: transform)
-        let target = map(match.targetFrame, transform: transform)
-        NSColor(hex: 0x64d2ff, alpha: 0.95).setStroke()
-        let sourcePath = NSBezierPath(roundedRect: source, xRadius: 7, yRadius: 7)
-        sourcePath.lineWidth = 3
-        sourcePath.stroke()
-        let targetPath = NSBezierPath(roundedRect: target, xRadius: 7, yRadius: 7)
-        targetPath.lineWidth = 3
-        targetPath.stroke()
-
-        let line = NSBezierPath()
-        line.move(to: CGPoint(x: source.midX, y: source.midY))
-        line.line(to: CGPoint(x: target.midX, y: target.midY))
-        line.lineWidth = 2
-        line.stroke()
-    }
-
-    private func drawGrid(in rect: NSRect) {
-        NSColor(hex: 0x414755, alpha: 0.24).setStroke()
-        let path = NSBezierPath()
-        let step: CGFloat = 48
-        var x = rect.minX
-        while x <= rect.maxX {
-            path.move(to: CGPoint(x: x, y: rect.minY))
-            path.line(to: CGPoint(x: x, y: rect.maxY))
-            x += step
-        }
-        var y = rect.minY
-        while y <= rect.maxY {
-            path.move(to: CGPoint(x: rect.minX, y: y))
-            path.line(to: CGPoint(x: rect.maxX, y: y))
-            y += step
-        }
-        path.lineWidth = 1
-        path.stroke()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        guard let hit = renderedRects.reversed().first(where: { $0.rect.contains(point) }) else {
-            dragState = nil
-            return
-        }
-        let transform = lastTransform ?? makeTransform(for: arrangementItems())
-        pinnedTransform = transform
-        dragState = DragState(
-            machine: hit.machine,
-            startPoint: point,
-            originalOffset: machineOffsets[hit.machine] ?? .zero,
-            transform: transform
-        )
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard let dragState else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        let delta = CGPoint(
-            x: (point.x - dragState.startPoint.x) / dragState.transform.scale,
-            y: (point.y - dragState.startPoint.y) / dragState.transform.scale
-        )
-        let proposed = CGPoint(
-            x: dragState.originalOffset.x + delta.x,
-            y: dragState.originalOffset.y + delta.y
-        )
-        let snapped = snappedOffset(for: dragState.machine, proposed: proposed)
-        machineOffsets[dragState.machine] = snapped.offset
-        snapMatch = snapped.match
-        needsDisplay = true
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        guard dragState != nil else { return }
-        dragState = nil
-        snapMatch = nil
-        onOffsetsChanged?(machineOffsets)
-    }
-
-    private func snappedOffset(for machine: String, proposed: CGPoint) -> SnapResult {
-        var offsets = machineOffsets
-        offsets[machine] = proposed
-        let items = arrangementItems(offsets: offsets)
-        let moving = items.filter { $0.machine == machine }
-        let anchors = items.filter { $0.machine != machine }
-        guard !moving.isEmpty, !anchors.isEmpty else {
-            return SnapResult(offset: proposed, match: nil)
-        }
-
-        var bestOffset = proposed
-        var bestMatch: SnapMatch?
-        var bestScore = CGFloat.greatestFiniteMagnitude
-
-        for source in moving {
-            for target in anchors {
-                evaluateSnap(
-                    source: source.virtualFrame,
-                    target: target.virtualFrame,
-                    proposed: proposed,
-                    edgeDelta: CGPoint(x: target.virtualFrame.minX - source.virtualFrame.maxX, y: 0),
-                    axisDelta: verticalSnapDelta(source.virtualFrame, target.virtualFrame),
-                    bestOffset: &bestOffset,
-                    bestMatch: &bestMatch,
-                    bestScore: &bestScore
-                )
-                evaluateSnap(
-                    source: source.virtualFrame,
-                    target: target.virtualFrame,
-                    proposed: proposed,
-                    edgeDelta: CGPoint(x: target.virtualFrame.maxX - source.virtualFrame.minX, y: 0),
-                    axisDelta: verticalSnapDelta(source.virtualFrame, target.virtualFrame),
-                    bestOffset: &bestOffset,
-                    bestMatch: &bestMatch,
-                    bestScore: &bestScore
-                )
-                evaluateSnap(
-                    source: source.virtualFrame,
-                    target: target.virtualFrame,
-                    proposed: proposed,
-                    edgeDelta: CGPoint(x: 0, y: target.virtualFrame.minY - source.virtualFrame.maxY),
-                    axisDelta: horizontalSnapDelta(source.virtualFrame, target.virtualFrame),
-                    bestOffset: &bestOffset,
-                    bestMatch: &bestMatch,
-                    bestScore: &bestScore
-                )
-                evaluateSnap(
-                    source: source.virtualFrame,
-                    target: target.virtualFrame,
-                    proposed: proposed,
-                    edgeDelta: CGPoint(x: 0, y: target.virtualFrame.maxY - source.virtualFrame.minY),
-                    axisDelta: horizontalSnapDelta(source.virtualFrame, target.virtualFrame),
-                    bestOffset: &bestOffset,
-                    bestMatch: &bestMatch,
-                    bestScore: &bestScore
-                )
-            }
-        }
-
-        return SnapResult(offset: bestOffset, match: bestMatch)
-    }
-
-    private func evaluateSnap(
-        source: CGRect,
-        target: CGRect,
-        proposed: CGPoint,
-        edgeDelta: CGPoint,
-        axisDelta: CGPoint,
-        bestOffset: inout CGPoint,
-        bestMatch: inout SnapMatch?,
-        bestScore: inout CGFloat
-    ) {
-        let edgeDistance = abs(edgeDelta.x) + abs(edgeDelta.y)
-        let axisDistance = abs(axisDelta.x) + abs(axisDelta.y)
-        guard edgeDistance <= snapDistance, axisDistance <= snapDistance else { return }
-
-        let candidateOffset = CGPoint(
-            x: proposed.x + edgeDelta.x + axisDelta.x,
-            y: proposed.y + edgeDelta.y + axisDelta.y
-        )
-        let snappedSource = source.offsetBy(dx: edgeDelta.x + axisDelta.x, dy: edgeDelta.y + axisDelta.y)
-        guard rangesOverlap(snappedSource.minX, snappedSource.maxX, target.minX, target.maxX) ||
-              rangesOverlap(snappedSource.minY, snappedSource.maxY, target.minY, target.maxY)
-        else { return }
-
-        let score = edgeDistance + axisDistance * 0.5
-        if score < bestScore {
-            bestScore = score
-            bestOffset = candidateOffset
-            bestMatch = SnapMatch(sourceFrame: snappedSource, targetFrame: target)
-        }
-    }
-
-    private func verticalSnapDelta(_ source: CGRect, _ target: CGRect) -> CGPoint {
-        let candidates = [
-            target.minY - source.minY,
-            target.maxY - source.maxY,
-            target.midY - source.midY,
-            CGFloat(0)
-        ]
-        let best = candidates.min { abs($0) < abs($1) } ?? 0
-        return CGPoint(x: 0, y: abs(best) <= snapDistance ? best : 0)
-    }
-
-    private func horizontalSnapDelta(_ source: CGRect, _ target: CGRect) -> CGPoint {
-        let candidates = [
-            target.minX - source.minX,
-            target.maxX - source.maxX,
-            target.midX - source.midX,
-            CGFloat(0)
-        ]
-        let best = candidates.min { abs($0) < abs($1) } ?? 0
-        return CGPoint(x: abs(best) <= snapDistance ? best : 0, y: 0)
-    }
-
-    private func rangesOverlap(_ aMin: CGFloat, _ aMax: CGFloat, _ bMin: CGFloat, _ bMax: CGFloat) -> Bool {
-        min(aMax, bMax) - max(aMin, bMin) > 1
-    }
-
-    private func drawCentered(_ text: String, in rect: NSRect, font: NSFont, color: NSColor) {
-        let style = NSMutableParagraphStyle()
-        style.alignment = .center
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: color,
-            .paragraphStyle: style
-        ]
-        let attributed = NSAttributedString(string: text, attributes: attrs)
-        let size = attributed.boundingRect(with: rect.size, options: [.usesLineFragmentOrigin]).size
-        let point = CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2)
-        attributed.draw(at: point)
-    }
-
-    private func drawText(_ text: String, at point: CGPoint, font: NSFont = .systemFont(ofSize: 13), color: NSColor = .secondaryLabelColor) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: color
-        ]
-        text.draw(at: point, withAttributes: attrs)
-    }
-}
-
 final class PortalServer {
     private var listener: NWListener?
     private var udpSocket: Int32 = -1
@@ -2106,6 +743,7 @@ final class PortalServer {
     var localDisplayProvider: (() -> [DisplayInfo])?
     var arrangementOffsetsProvider: (() -> [String: CGPoint])?
     var activationTargetProvider: ((Edge, Double, Double, DisplayInfo?) -> CGRect?)?
+    var activationReturnEdgeProvider: ((Edge, DisplayInfo?) -> Edge?)?
     var returnAllowedProvider: ((Edge, CGPoint) -> Bool)? {
         didSet { injector.returnAllowedProvider = returnAllowedProvider }
     }
@@ -2339,13 +977,16 @@ final class PortalServer {
                 let xRatio = obj["xRatio"] as? Double ?? 0.5
                 let sourceDisplay = (obj["screen"] as? [String: Any]).flatMap(Self.parseDisplayInfo)
                 var targetFrame: CGRect?
+                var linkedReturnEdge: Edge?
                 var shouldActivate = true
                 if let activationTargetProvider {
                     if Thread.isMainThread {
                         targetFrame = activationTargetProvider(edge, xRatio, yRatio, sourceDisplay)
+                        linkedReturnEdge = activationReturnEdgeProvider?(edge, sourceDisplay)
                     } else {
                         DispatchQueue.main.sync {
                             targetFrame = activationTargetProvider(edge, xRatio, yRatio, sourceDisplay)
+                            linkedReturnEdge = activationReturnEdgeProvider?(edge, sourceDisplay)
                         }
                     }
                     shouldActivate = sourceDisplay == nil || targetFrame != nil
@@ -2356,8 +997,9 @@ final class PortalServer {
                 }
                 inputQueue.async { [weak self] in
                     guard let self else { return }
-                    self.injector.returnEdge = edge.opposite
-                    self.recordEvent("return edge \(edge.opposite.rawValue)")
+                    let returnEdge = linkedReturnEdge ?? edge.opposite
+                    self.injector.returnEdge = returnEdge
+                    self.recordEvent("return edge \(returnEdge.rawValue)")
                     self.injector.activate(from: edge, yRatio: yRatio, xRatio: xRatio, targetFrame: targetFrame)
                 }
             }
@@ -2699,275 +1341,142 @@ final class PortalServer {
     }
 }
 
-final class MacBeaconBroadcaster {
-    private let discoveryPort: UInt16
-    private let queue = DispatchQueue(label: "portal.mac.beacon", qos: .utility)
-    private var timer: DispatchSourceTimer?
-    private var serverPort: UInt16 = 45877
-    private var addressesProvider: (() -> [String])?
+final class InstallerHTTPServer {
+    private let queue = DispatchQueue(label: "portal.installer.http")
+    private var listener: NWListener?
+    private var fileURL: URL?
+    private let servedPath = "/Portal-Windows-installer.zip"
+    var onFailure: ((String) -> Void)?
 
-    init(discoveryPort: UInt16) {
-        self.discoveryPort = discoveryPort
-    }
+    func start(fileURL: URL, port: UInt16) throws {
+        stop()
+        self.fileURL = fileURL
 
-    func start(serverPort: UInt16, addressesProvider: @escaping () -> [String]) {
-        self.serverPort = serverPort
-        self.addressesProvider = addressesProvider
-        guard timer == nil else { return }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
+        self.listener = listener
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .seconds(2))
-        timer.setEventHandler { [weak self] in
-            self?.broadcast()
-        }
-        self.timer = timer
-        timer.resume()
-    }
-
-    func stop() {
-        timer?.cancel()
-        timer = nil
-    }
-
-    private func broadcast() {
-        guard let addresses = addressesProvider?(), !addresses.isEmpty else { return }
-
-        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { return }
-        defer { Darwin.close(fd) }
-
-        var enabled: Int32 = 1
-        _ = withUnsafePointer(to: &enabled) {
-            setsockopt(fd, SOL_SOCKET, SO_BROADCAST, $0, socklen_t(MemoryLayout<Int32>.size))
-        }
-
-        var target = sockaddr_in()
-        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        target.sin_family = sa_family_t(AF_INET)
-        target.sin_port = discoveryPort.bigEndian
-        target.sin_addr = in_addr(s_addr: INADDR_BROADCAST.bigEndian)
-
-        for ip in addresses {
-            guard let payload = try? JSONSerialization.data(withJSONObject: [
-                "type": "portalMacBeacon",
-                "ip": ip,
-                "port": Int(serverPort)
-            ]) else { continue }
-
-            payload.withUnsafeBytes { rawBuffer in
-                guard let baseAddress = rawBuffer.baseAddress else { return }
-                withUnsafePointer(to: &target) { pointer in
-                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                        _ = Darwin.sendto(fd, baseAddress, payload.count, 0, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
-                    }
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .failed(let error) = state {
+                self.stop()
+                DispatchQueue.main.async {
+                    self.onFailure?(Self.message(for: error))
                 }
             }
         }
-    }
-}
 
-private struct ClipboardSnapshot {
-    let id: String
-    let contentType: String
-    let text: String?
-    let dataBase64: String?
-    let byteCount: Int
-    let signature: String
-
-    var payload: [String: Any] {
-        var payload: [String: Any] = [
-            "type": "clipboard",
-            "id": id,
-            "contentType": contentType,
-            "byteCount": byteCount
-        ]
-        if let text {
-            payload["text"] = text
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection)
         }
-        if let dataBase64 {
-            payload["data"] = dataBase64
-        }
-        return payload
-    }
-}
-
-final class ClipboardBridge {
-    private let maxImageBytes = 8 * 1024 * 1024
-    private let logURL = URL(fileURLWithPath: "/tmp/portal-clipboard.log")
-    private var timer: Timer?
-    private var lastChangeCount = -1
-    private var lastLocalSignature: String?
-    private var lastAppliedSignature: String?
-    private var sendPayload: (([String: Any]) -> Bool)?
-    private var publishStatus: ((String) -> Void)?
-
-    func start(send: @escaping ([String: Any]) -> Bool, status: @escaping (String) -> Void) {
-        sendPayload = send
-        publishStatus = status
-        status("Clipboard: text and images ready")
-        log("bridge start")
-        timer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
-            self?.pollLocalClipboard()
-        }
+        listener.start(queue: queue)
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        listener?.cancel()
+        listener = nil
+        fileURL = nil
     }
 
-    func republishCurrentClipboard() {
-        lastChangeCount = -1
-        log("republish current clipboard")
-        pollLocalClipboard()
+    static func message(for error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(EADDRINUSE) {
+            return "Installer sharing failed: port is already in use"
+        }
+        return "Installer sharing failed: \(nsError.localizedDescription)"
     }
 
-    func applyRemotePayload(_ payload: [String: Any]) {
-        guard let contentType = payload["contentType"] as? String else { return }
-        let text = payload["text"] as? String
-        let dataBase64 = payload["data"] as? String
-        guard contentType == "text/plain" || contentType == "image/png" else { return }
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receiveRequest(on: connection, buffer: Data())
+    }
 
-        let signature = Self.signature(contentType: contentType, text: text, dataBase64: dataBase64)
-        if signature == lastLocalSignature || signature == lastAppliedSignature { return }
-
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-
-        switch contentType {
-        case "text/plain":
-            guard let text else { return }
-            pasteboard.setString(text, forType: .string)
-            log("received text bytes=\(text.utf8.count)")
-            publishStatus?("Clipboard: received text")
-        case "image/png":
-            guard let dataBase64,
-                  let data = Data(base64Encoded: dataBase64),
-                  data.count <= maxImageBytes
-            else { return }
-            pasteboard.setData(data, forType: .png)
-            if let image = NSImage(data: data),
-               let tiff = image.tiffRepresentation {
-                pasteboard.setData(tiff, forType: .tiff)
+    private func receiveRequest(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let error {
+                connection.cancel()
+                DispatchQueue.main.async {
+                    self.onFailure?(Self.message(for: error))
+                }
+                return
             }
-            log("received image bytes=\(data.count)")
-            publishStatus?("Clipboard: received image")
-        default:
+
+            var requestBuffer = buffer
+            if let data {
+                requestBuffer.append(data)
+            }
+
+            if requestBuffer.range(of: Data("\r\n\r\n".utf8)) != nil {
+                self.respond(to: connection, request: requestBuffer)
+                return
+            }
+
+            if isComplete || requestBuffer.count >= 8192 {
+                self.sendSimpleResponse(on: connection, status: "400 Bad Request", body: Data())
+                return
+            }
+
+            self.receiveRequest(on: connection, buffer: requestBuffer)
+        }
+    }
+
+    private func respond(to connection: NWConnection, request: Data) {
+        guard
+            let header = String(data: request, encoding: .utf8),
+            let firstLine = header.components(separatedBy: "\r\n").first
+        else {
+            sendSimpleResponse(on: connection, status: "400 Bad Request", body: Data())
             return
         }
 
-        lastAppliedSignature = signature
-        lastLocalSignature = signature
-        lastChangeCount = pasteboard.changeCount
-    }
-
-    private func pollLocalClipboard() {
-        let pasteboard = NSPasteboard.general
-        guard pasteboard.changeCount != lastChangeCount else { return }
-        lastChangeCount = pasteboard.changeCount
-        log("change count \(lastChangeCount)")
-
-        guard let snapshot = readLocalClipboard(from: pasteboard) else {
-            log("no supported local clipboard item")
-            return
-        }
-        if snapshot.signature == lastLocalSignature || snapshot.signature == lastAppliedSignature {
-            log("skip duplicate \(snapshot.contentType)")
+        let parts = firstLine.split(separator: " ")
+        guard parts.count >= 2 else {
+            sendSimpleResponse(on: connection, status: "400 Bad Request", body: Data())
             return
         }
 
-        if snapshot.byteCount > maxImageBytes {
-            lastLocalSignature = snapshot.signature
-            log("skip oversized \(snapshot.byteCount)")
-            publishStatus?("Clipboard: image too large")
+        let method = String(parts[0])
+        let path = String(parts[1])
+        guard method == "GET", path == servedPath, let fileURL else {
+            sendSimpleResponse(on: connection, status: "404 Not Found", body: Data())
             return
         }
 
-        let sent = sendPayload?(snapshot.payload) == true
-        log("send \(snapshot.contentType) bytes=\(snapshot.byteCount) result=\(sent)")
-        if sent {
-            lastLocalSignature = snapshot.signature
-            publishStatus?(snapshot.contentType == "text/plain" ? "Clipboard: sent text" : "Clipboard: sent image")
+        do {
+            let body = try Data(contentsOf: fileURL)
+            sendFileResponse(on: connection, body: body)
+        } catch {
+            sendSimpleResponse(on: connection, status: "500 Internal Server Error", body: Data())
+            DispatchQueue.main.async {
+                self.onFailure?("Installer file could not be read")
+            }
         }
     }
 
-    private func log(_ message: String) {
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: logURL.path),
-           let handle = try? FileHandle(forWritingTo: logURL) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
-        } else {
-            try? data.write(to: logURL)
-        }
+    private func sendFileResponse(on connection: NWConnection, body: Data) {
+        var header = "HTTP/1.1 200 OK\r\n"
+        header += "Content-Type: application/zip\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Content-Disposition: attachment; filename=\"Portal-Windows-installer.zip\"\r\n"
+        header += "Connection: close\r\n\r\n"
+        var response = Data(header.utf8)
+        response.append(body)
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 
-    private func readLocalClipboard(from pasteboard: NSPasteboard) -> ClipboardSnapshot? {
-        if let imageData = imagePNGData(from: pasteboard) {
-            let dataBase64 = imageData.base64EncodedString()
-            let signature = Self.signature(contentType: "image/png", text: nil, dataBase64: dataBase64)
-            return ClipboardSnapshot(
-                id: UUID().uuidString,
-                contentType: "image/png",
-                text: nil,
-                dataBase64: dataBase64,
-                byteCount: imageData.count,
-                signature: signature
-            )
-        }
-
-        guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return nil }
-        let signature = Self.signature(contentType: "text/plain", text: text, dataBase64: nil)
-        return ClipboardSnapshot(
-            id: UUID().uuidString,
-            contentType: "text/plain",
-            text: text,
-            dataBase64: nil,
-            byteCount: text.lengthOfBytes(using: .utf8),
-            signature: signature
-        )
-    }
-
-    private func imagePNGData(from pasteboard: NSPasteboard) -> Data? {
-        if let png = pasteboard.data(forType: .png) {
-            return png
-        }
-        if let tiff = pasteboard.data(forType: .tiff),
-           let image = NSImage(data: tiff) {
-            return Self.pngData(from: image)
-        }
-        if let image = NSImage(pasteboard: pasteboard) {
-            return Self.pngData(from: image)
-        }
-        return nil
-    }
-
-    private static func pngData(from image: NSImage) -> Data? {
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff)
-        else { return nil }
-        return bitmap.representation(using: .png, properties: [:])
-    }
-
-    private static func signature(contentType: String, text: String?, dataBase64: String?) -> String {
-        var hash: UInt64 = 14_695_981_039_346_656_037
-
-        func mix(_ byte: UInt8) {
-            hash ^= UInt64(byte)
-            hash &*= 1_099_511_628_211
-        }
-
-        for byte in contentType.utf8 { mix(byte) }
-        mix(0)
-        if let text {
-            for byte in text.utf8 { mix(byte) }
-        }
-        if let dataBase64 {
-            for byte in dataBase64.utf8 { mix(byte) }
-        }
-        return String(format: "%016llx", hash)
+    private func sendSimpleResponse(on connection: NWConnection, status: String, body: Data) {
+        var header = "HTTP/1.1 \(status)\r\n"
+        header += "Content-Length: \(body.count)\r\n"
+        header += "Connection: close\r\n\r\n"
+        var response = Data(header.utf8)
+        response.append(body)
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
     }
 }
 
@@ -2984,33 +1493,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem?
     private var statusStartStopItem: NSMenuItem?
     private var window: NSWindow!
-    private let portField = NSTextField(string: "45877")
-    private let edgePopup = NSPopUpButton()
     private let statusLabel = NSTextField(labelWithString: "Stopped")
     private let ipLabel = NSTextField(labelWithString: "IP: checking...")
     private let displayLabel = NSTextField(labelWithString: "Displays: checking...")
     private let permissionLabel = NSTextField(labelWithString: "Accessibility: use the enabled switch in System Settings")
     private let awdlLabel = NSTextField(labelWithString: "Low latency: checking...")
     private let clipboardLabel = NSTextField(labelWithString: "Clipboard: starting...")
-    private let awdlSwitch = NSSwitch()
-    private let settingsButton = NSButton(title: "Open Accessibility Settings", target: nil, action: nil)
     private let eventLabel = NSTextField(labelWithString: "Stats: idle")
     private let motionGraph = MotionGraphView()
     private let uiModel = PortalUIModel()
     private let arrangementView = DisplayArrangementView()
-    private let arrangementLabel = NSTextField(labelWithString: "Arrangement: checking...")
-    private let resetArrangementButton = NSButton(title: "Reset Arrangement", target: nil, action: nil)
-    private let startButton = NSButton(title: "Start", target: nil, action: nil)
     private var running = false
     private var eventCount = 0
     private var starting = false
     private var autoStarted = false
     private var remoteWindowsDisplays: [DisplayInfo] = []
     private var machineOffsets: [String: CGPoint] = [:]
+    private var anchorLink: ArrangementAnchorLink?
     private var accessibilityTimer: Timer?
     private var networkTimer: Timer?
-    private var installerServerProcess: Process?
-    private let installerPort = 8123
+    private let installerServer = InstallerHTTPServer()
+    private var installerServerStopRequested = false
+    private let installerPort: UInt16 = 8123
+    private var activeInstallerPort: UInt16?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -3021,11 +1526,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.motionProbe = motionProbe
         motionLogWriter = MotionLogWriter(probe: motionProbe)
         machineOffsets = loadMachineOffsets()
+        anchorLink = loadAnchorLink()
         arrangementView.machineOffsets = machineOffsets
-        arrangementView.onOffsetsChanged = { [weak self] offsets in
-            self?.machineOffsets = offsets
-            self?.saveMachineOffsets(offsets)
+        arrangementView.anchorLink = anchorLink
+        arrangementView.onAnchorLinkChanged = { [weak self] link in
+            self?.anchorLink = link
+            self?.saveAnchorLink(link)
             self?.server.sendLocalDisplayLayout()
+            self?.refreshDisplayLabel()
         }
         buildWindow()
         showPortalWindow()
@@ -3041,6 +1549,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.activationTargetProvider = { [weak self] edge, xRatio, yRatio, sourceDisplay in
             self?.resolveActivationTarget(edge: edge, xRatio: xRatio, yRatio: yRatio, sourceDisplay: sourceDisplay)
         }
+        server.activationReturnEdgeProvider = { [weak self] _, sourceDisplay in
+            self?.resolveActivationReturnEdge(sourceDisplay: sourceDisplay)
+        }
         server.returnAllowedProvider = { [weak self] edge, point in
             self?.arrangementAllowsReturn(edge: edge, point: point) ?? false
         }
@@ -3053,6 +1564,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         server.onConnectionReady = { [weak self] in
             self?.clipboardBridge.republishCurrentClipboard()
+        }
+        installerServer.onFailure = { [weak self] message in
+            self?.installerServerStopRequested = false
+            self?.uiModel.isServingInstaller = false
+            self?.uiModel.windowsInstallerURL = ""
+            self?.uiModel.windowsInstallCommand = ""
+            self?.uiModel.windowsSetupStatus = message
         }
         if bidirectionalWindowsControlEnabled {
             server.onReleaseFromWindows = { [weak self] edge, xRatio, yRatio in
@@ -3132,23 +1650,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 860, height: 560),
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: PortalChromeMetrics.windowWidth,
+                height: PortalChromeMetrics.windowHeight
+            ),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Portal"
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 860, height: 560)
-        window.maxSize = NSSize(width: 860, height: 560)
-        window.backgroundColor = NSColor(calibratedWhite: 0.13, alpha: 1)
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.styleMask.insert(.fullSizeContentView)
-        positionWindowOnMainScreen()
+        if let zoomButton = window.standardWindowButton(.zoomButton) {
+            zoomButton.isEnabled = false
+        }
+        let fixedSize = NSSize(
+            width: PortalChromeMetrics.windowWidth,
+            height: PortalChromeMetrics.windowHeight
+        )
+        window.setContentSize(fixedSize)
+        window.minSize = fixedSize
+        window.maxSize = fixedSize
+        enforceFixedWindowFrame()
         motionGraph.probe = motionProbe
-        uiModel.port = portField.stringValue
-        uiModel.edge = Edge(rawValue: edgePopup.titleOfSelectedItem ?? "right") ?? .right
         let rootView = PortalRootView(
             model: uiModel,
             motionGraph: motionGraph,
@@ -3162,24 +1687,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             copyWindowsInstallCommand: { [weak self] in self?.copyWindowsInstallCommand() }
         )
         window.contentView = NSHostingView(rootView: rootView)
+        enforceFixedWindowFrame()
         refreshIpLabel()
         refreshDisplayLabel()
     }
 
-    private func positionWindowOnMainScreen() {
+    private func enforceFixedWindowFrame() {
         let primaryScreen = NSScreen.screens.max {
             ($0.visibleFrame.width * $0.visibleFrame.height) < ($1.visibleFrame.width * $1.visibleFrame.height)
         } ?? NSScreen.main
         guard let screen = primaryScreen else {
+            let contentRect = NSRect(
+                x: 0,
+                y: 0,
+                width: PortalChromeMetrics.windowWidth,
+                height: PortalChromeMetrics.windowHeight
+            )
+            let frameRect = window.frameRect(forContentRect: contentRect)
+            window.setFrame(frameRect, display: true)
             window.center()
             return
         }
+
+        let contentRect = NSRect(
+            x: 0,
+            y: 0,
+            width: PortalChromeMetrics.windowWidth,
+            height: PortalChromeMetrics.windowHeight
+        )
+        let frameRect = window.frameRect(forContentRect: contentRect)
         let visible = screen.visibleFrame
-        let frame = window.frame
-        window.setFrameOrigin(NSPoint(
-            x: visible.midX - frame.width / 2,
-            y: visible.midY - frame.height / 2
-        ))
+        let target = NSRect(
+            x: visible.midX - frameRect.width / 2,
+            y: visible.midY - frameRect.height / 2,
+            width: frameRect.width,
+            height: frameRect.height
+        )
+        window.setFrame(target, display: true)
     }
 
     private func buildStatusItem() {
@@ -3256,7 +1800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         refreshAccessibilityStatus()
-        let edge = uiModel.edge
+        let edge = anchorLink?.macEdge ?? .right
         starting = true
         statusStartStopItem?.isEnabled = false
         uiModel.isStarting = true
@@ -3298,7 +1842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showPortalWindow() {
-        positionWindowOnMainScreen()
+        enforceFixedWindowFrame()
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         window.makeFirstResponder(nil)
@@ -3317,7 +1861,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateRunningControls() {
-        startButton.title = running ? "Stop" : "Start"
         uiModel.isRunning = running
         updateStatusMenu()
     }
@@ -3341,7 +1884,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         permissionLabel.textColor = .secondaryLabelColor
         uiModel.accessibility = permissionLabel.stringValue
         uiModel.accessibilityOK = false
-        settingsButton.isHidden = false
     }
 
     @objc private func openAccessibilitySettings() {
@@ -3372,7 +1914,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func resetArrangement() {
         machineOffsets = [:]
         saveMachineOffsets(machineOffsets)
+        anchorLink = nil
+        saveAnchorLink(nil)
         arrangementView.machineOffsets = machineOffsets
+        arrangementView.anchorLink = nil
         arrangementView.resetViewport()
         refreshDisplayLabel()
     }
@@ -3389,7 +1934,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         permissionLabel.textColor = trusted ? .systemGreen : .systemOrange
         uiModel.accessibility = permissionLabel.stringValue
         uiModel.accessibilityOK = trusted
-        settingsButton.isHidden = false
         if trusted {
             accessibilityTimer?.invalidate()
             accessibilityTimer = nil
@@ -3401,24 +1945,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case true:
             awdlLabel.stringValue = "Enabled - cursor may stutter on Wi-Fi"
             awdlLabel.textColor = .systemOrange
-            awdlSwitch.state = .on
-            awdlSwitch.isEnabled = true
             uiModel.awdlEnabled = true
             uiModel.awdlText = awdlLabel.stringValue
             uiModel.awdlColor = .portalOrange
         case false:
             awdlLabel.stringValue = "Disabled - low latency mode"
             awdlLabel.textColor = .systemGreen
-            awdlSwitch.state = .off
-            awdlSwitch.isEnabled = true
             uiModel.awdlEnabled = false
             uiModel.awdlText = awdlLabel.stringValue
             uiModel.awdlColor = .portalGreen
         case nil:
             awdlLabel.stringValue = "Low latency: AWDL interface not found"
             awdlLabel.textColor = .secondaryLabelColor
-            awdlSwitch.state = .off
-            awdlSwitch.isEnabled = false
             uiModel.awdlEnabled = false
             uiModel.awdlText = awdlLabel.stringValue
             uiModel.awdlColor = .secondary
@@ -3426,7 +1964,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setAwdl(enabled: Bool, promptIfNeeded: Bool, completion: ((Bool) -> Void)? = nil) {
-        awdlSwitch.isEnabled = false
         awdlLabel.stringValue = enabled ? "Enabling AWDL..." : "Disabling AWDL..."
         awdlLabel.textColor = .secondaryLabelColor
         uiModel.awdlEnabled = enabled
@@ -3672,7 +2209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleInstallerServer() {
-        if installerServerProcess?.isRunning == true {
+        if uiModel.isServingInstaller {
             stopInstallerServer()
         } else {
             startInstallerServer()
@@ -3680,7 +2217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startInstallerServer() {
-        guard installerServerProcess?.isRunning != true else { return }
+        guard !uiModel.isServingInstaller else { return }
         guard let zip = installerZipURL(), FileManager.default.fileExists(atPath: zip.path) else {
             uiModel.windowsSetupStatus = "Windows installer zip not found in dist"
             uiModel.windowsInstallerURL = ""
@@ -3692,45 +2229,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let distURL = zip.deletingLastPathComponent()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = ["-m", "http.server", "\(installerPort)", "--bind", "0.0.0.0"]
-        process.currentDirectoryURL = distURL
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        process.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                guard self?.installerServerProcess === process else { return }
-                self?.installerServerProcess = nil
-                self?.uiModel.isServingInstaller = false
-                self?.uiModel.windowsInstallerURL = ""
-                self?.uiModel.windowsInstallCommand = ""
-            }
+        installerServerStopRequested = false
+        uiModel.windowsSetupStatus = "Starting installer sharing..."
+        uiModel.isServingInstaller = false
+        uiModel.windowsInstallerURL = ""
+        uiModel.windowsInstallCommand = ""
+
+        guard let selectedPort = firstAvailableInstallerPort() else {
+            activeInstallerPort = nil
+            uiModel.windowsSetupStatus = "Installer sharing failed: no free local port found"
+            return
         }
 
         do {
-            try process.run()
-            installerServerProcess = process
-            let url = "http://\(localIP):\(installerPort)/Portal-Windows-installer.zip"
+            try installerServer.start(fileURL: zip, port: selectedPort)
+            activeInstallerPort = selectedPort
+            let url = "http://\(localIP):\(selectedPort)/Portal-Windows-installer.zip"
             uiModel.isServingInstaller = true
             uiModel.windowsInstallerURL = url
             uiModel.windowsInstallCommand = windowsPowerShellInstallCommand(url: url)
             uiModel.windowsSetupStatus = "Installer sharing active"
         } catch {
-            uiModel.windowsSetupStatus = "Installer sharing failed: \(error.localizedDescription)"
+            activeInstallerPort = nil
+            uiModel.windowsSetupStatus = InstallerHTTPServer.message(for: error)
         }
     }
 
     private func stopInstallerServer() {
-        if installerServerProcess?.isRunning == true {
-            installerServerProcess?.terminate()
-        }
-        installerServerProcess = nil
+        installerServerStopRequested = true
+        installerServer.stop()
+        activeInstallerPort = nil
         uiModel.isServingInstaller = false
         uiModel.windowsInstallerURL = ""
         uiModel.windowsInstallCommand = ""
-        if uiModel.windowsSetupStatus == "Installer sharing active" {
+        if uiModel.windowsSetupStatus == "Installer sharing active" || uiModel.windowsSetupStatus == "Starting installer sharing..." {
             uiModel.windowsSetupStatus = "Installer sharing stopped"
         }
     }
@@ -3741,6 +2273,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteboard.clearContents()
         pasteboard.setString(uiModel.windowsInstallCommand, forType: .string)
         uiModel.windowsSetupStatus = "Windows install command copied"
+    }
+
+    private func firstAvailableInstallerPort() -> UInt16? {
+        let candidatePorts = [installerPort] + Array((installerPort + 1)...(installerPort + 10))
+        return candidatePorts.first(where: isLocalTCPPortAvailable)
+    }
+
+    private func isLocalTCPPortAvailable(_ port: UInt16) -> Bool {
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+
+        var yes: Int32 = 1
+        _ = withUnsafePointer(to: &yes) {
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, $0, socklen_t(MemoryLayout<Int32>.size))
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("0.0.0.0"))
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                Darwin.bind(fd, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return bindResult == 0
     }
 
     private func installerZipURL() -> URL? {
@@ -3788,16 +2349,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         arrangementView.macDisplays = displays
         arrangementView.windowsDisplays = remoteWindowsDisplays
         arrangementView.machineOffsets = machineOffsets
+        arrangementView.anchorLink = anchorLink
         guard !displays.isEmpty else {
-            arrangementLabel.stringValue = "Arrangement: not found"
             uiModel.arrangement = "not found"
             return
         }
         server.sendLocalDisplayLayout()
         let macSummary = displaySummary(displays)
         let windowsSummary = remoteWindowsDisplays.isEmpty ? "waiting" : displaySummary(remoteWindowsDisplays)
-        arrangementLabel.stringValue = "Mac: \(macSummary)\nWindows: \(windowsSummary)"
-        uiModel.arrangement = "Mac: \(macSummary)\nWindows: \(windowsSummary)"
+        let linkSummary = arrangementLinkSummary()
+        uiModel.arrangement = "Mac: \(macSummary)\nWindows: \(windowsSummary)\nLink: \(linkSummary)"
     }
 
     private func activationForWindows(at point: CGPoint) -> EdgeActivation? {
@@ -3852,6 +2413,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sourceItem = windowsItems.first(where: \.isPrimary) ?? (windowsItems.count == 1 ? windowsItems[0] : nil)
         }
         guard let sourceItem else { return fallbackTarget() }
+        if let linked = linkedMacItem(forWindowsItem: sourceItem, in: items) {
+            return linked.nativeFrame
+        }
 
         let candidates = macItems.filter { edgeCandidate($0.virtualFrame, isOn: edge, from: sourceItem.virtualFrame) }
         guard !candidates.isEmpty else { return fallbackTarget() }
@@ -3861,15 +2425,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }?.nativeFrame
     }
 
+    private func resolveActivationReturnEdge(sourceDisplay: DisplayInfo?) -> Edge? {
+        guard let sourceDisplay, let anchorLink else { return nil }
+        let items = arrangementView.arrangementItems()
+        let windowsItems = items.filter { $0.machine == "windows" }
+        guard let sourceItem = windowsItems.first(where: { displayMatches(item: $0, display: sourceDisplay) }),
+              sourceItem.id == anchorLink.windowsItemId
+        else { return nil }
+        return anchorLink.macEdge
+    }
+
     private func arrangementAllowsReturn(edge: Edge, point: CGPoint) -> Bool {
         let items = arrangementView.arrangementItems()
         let windowsItems = items.filter { $0.machine == "windows" }
-        if windowsItems.isEmpty || machineOffsets.isEmpty {
+        if windowsItems.isEmpty || anchorLink == nil {
             return true
         }
         guard let sourceItem = items.first(where: {
             $0.machine == "mac" && $0.nativeFrame.contains(point)
         }) else { return false }
+        if let anchorLink, sourceItem.id == anchorLink.macItemId {
+            return edge == anchorLink.macEdge
+        }
         if windowsItems.contains(where: { edgeCandidate($0.virtualFrame, isOn: edge, from: sourceItem.virtualFrame) }) {
             return true
         }
@@ -3884,6 +2461,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return windowsItems.contains {
             edgeCandidate($0.virtualFrame, isOn: edge, from: sourceItem.virtualFrame)
         }
+    }
+
+    private func linkedMacItem(forWindowsItem windowsItem: ArrangementItem, in items: [ArrangementItem]) -> ArrangementItem? {
+        guard let anchorLink, windowsItem.id == anchorLink.windowsItemId else { return nil }
+        return items.first { $0.machine == "mac" && $0.id == anchorLink.macItemId }
+    }
+
+    private func arrangementLinkSummary() -> String {
+        guard let anchorLink else { return "select a Mac point and a Windows point" }
+        let items = arrangementView.arrangementItems()
+        let mac = items.first { $0.id == anchorLink.macItemId }
+        let windows = items.first { $0.id == anchorLink.windowsItemId }
+        let macName = mac.map { "M\($0.index + 1)\($0.isPrimary ? "*" : "")" } ?? "Mac"
+        let windowsName = windows.map { "W\($0.index + 1)\($0.isPrimary ? "*" : "")" } ?? "Windows"
+        return "\(macName) \(anchorLink.macEdge.rawValue) <-> \(windowsName) \(anchorLink.windowsEdge.rawValue)"
     }
 
     private func displayMatches(item: ArrangementItem, display: DisplayInfo) -> Bool {
@@ -3969,6 +2561,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let raw = offsets.mapValues { ["x": Double($0.x), "y": Double($0.y)] }
         guard let data = try? JSONSerialization.data(withJSONObject: raw) else { return }
         UserDefaults.standard.set(data, forKey: "portal.arrangement.origins.v1")
+    }
+
+    private func loadAnchorLink() -> ArrangementAnchorLink? {
+        guard let data = UserDefaults.standard.data(forKey: "portal.arrangement.anchorLink.v1") else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ArrangementAnchorLink.self, from: data)
+    }
+
+    private func saveAnchorLink(_ link: ArrangementAnchorLink?) {
+        guard let link else {
+            UserDefaults.standard.removeObject(forKey: "portal.arrangement.anchorLink.v1")
+            return
+        }
+        guard let data = try? JSONEncoder().encode(link) else { return }
+        UserDefaults.standard.set(data, forKey: "portal.arrangement.anchorLink.v1")
     }
 
     private func displayInfos() -> [DisplayInfo] {
