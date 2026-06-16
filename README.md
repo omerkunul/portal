@@ -6,7 +6,7 @@ Portal is built for a very specific workflow: a Windows-first desk setup where a
 
 It is not remote desktop. It does not stream the Mac screen. Instead, it forwards input over LAN and hands control across screen edges.
 
-![Portal UI preview](docs/assets/portal-ui-preview.png)
+![Portal UI preview](docs/assets/portal-app-clean.jpg)
 
 ## Why Portal exists
 
