@@ -1,10 +1,10 @@
 # Portal
 
-Portal is an open-source cross-platform input sharing tool that lets you control Windows and macOS computers with a single mouse and keyboard over the same local network.
+Portal is an open-source cross-platform input sharing tool that lets you control Windows and macOS computers with a single mouse and keyboard, while also syncing clipboard copy-paste between both machines over the same local network.
 
-Portal is built for a very specific workflow: a Windows-first desk setup where a nearby Mac should feel like an extension of the same workspace, not a separate remote session.
+Portal is built for a very specific workflow: a Windows-first desk setup where a nearby Mac should feel like an extension of the same workspace, not a separate remote session. The goal is native-feeling handoff with near-zero perceived latency, so pointer movement feels closer to direct local mouse speed than to a typical remote-control app.
 
-It is not remote desktop. It does not stream the Mac screen. Instead, it forwards input over LAN and hands control across screen edges.
+It is not remote desktop. It does not stream the Mac screen. Instead, it forwards input over LAN, syncs clipboard content, and hands control across screen edges.
 
 ![Portal UI preview](docs/assets/portal-app-clean.jpg)
 
@@ -63,6 +63,7 @@ Today it is:
 
 - Connects to the Mac listener by IP and port
 - Sends mouse, keyboard, and scroll events
+- Syncs clipboard text and images with the Mac
 - Can be packaged into an installable Windows bundle
 
 ## Repository layout
@@ -212,7 +213,7 @@ PORTAL_WIN_TARGET=user@windows-ip ./script/build_and_restart_windows_omerkunul.s
 - Transport is not hardened yet
 - Multi-monitor behavior is still being refined
 - Keyboard mapping is intentionally narrow today
-- Clipboard and file transfer are not complete product features yet
+- Clipboard sync currently focuses on text and images, not full file transfer
 - The Windows executable must be built on Windows because it targets `net8.0-windows`
 
 ## Distribution note
