@@ -1,181 +1,234 @@
 # Portal
 
-Small app pair for sharing the Windows-attached mouse/keyboard with a Mac over the same LAN.
+Portal is a LAN-based input handoff tool for people who work on a Windows machine and want to control a nearby Mac without reaching for a second keyboard and mouse.
 
-This is not remote desktop. It sends input events over TCP and the Mac injects them as native Quartz events.
+It is not remote desktop. Portal forwards input events over the local network and injects them on macOS so the Mac behaves like a directly connected machine.
 
-## App Builds
+## What Portal does
 
-- Mac app output: `dist/Portal.app`
-- Windows app project: `windows/PortalWindows`
-- Windows exe build script: `windows/build-windows-exe.ps1`
+- Lets a Windows workstation drive a Mac over the same LAN
+- Uses edge-based cursor handoff instead of a modal remote session
+- Shows a native macOS control app for setup, pairing, status, and layout
+- Ships a Windows companion app and installer package
+- Includes fast local installer sharing from the Mac app
 
-The older Python MVP files are still included as a fallback, but the app builds are the main path now.
+## Current status
 
-## Use on the Mac
+Portal is an active experimental project.
 
-Grant the terminal app Accessibility permission first:
+Today it is best described as:
 
-`System Settings -> Privacy & Security -> Accessibility`
+- a working local-network prototype
+- focused on macOS + Windows workflows
+- optimized for low-latency cursor and keyboard handoff
+- still evolving in packaging, security, and product polish
 
-If you run the packaged app, grant Accessibility permission to `Portal`.
+## How it works
+
+1. The Mac app starts a local listener on your network.
+2. The Windows app connects to the Mac using its IP address and port.
+3. When your cursor reaches the configured screen edge on Windows, Portal switches control to the Mac.
+4. Moving back to the return edge hands control to Windows again.
+
+## Repository layout
+
+```text
+mac/PortalMac/          Swift macOS app
+windows/                Windows build, packaging, and install scripts
+script/                 Cross-machine build and helper scripts
+docs/                   Project notes and release audits
+dist/                   Local build output (ignored by git)
+```
+
+## Features
+
+### macOS app
+
+- Native SwiftUI desktop interface
+- Live connection and activity status
+- Windows companion installer sharing
+- LAN scan flow for Windows candidates
+- Display arrangement preview
+- Accessibility permission onboarding
+
+### Windows companion
+
+- Connects to a Mac listener by IP and port
+- Sends mouse, keyboard, and scroll events
+- Supports packaging into an installable Windows bundle
+
+## Requirements
+
+### Mac
+
+- macOS 13 or newer
+- Accessibility permission for Portal
+- Same local network as the Windows machine
+
+### Windows
+
+- Windows 10 or newer
+- .NET 8 SDK if you want to build from source
+- Same local network as the Mac
+
+## Quick start
+
+### 1. Build and run the Mac app
+
+From the repository root:
 
 ```bash
 ./script/build_and_run.sh
 ```
 
-Portal starts listening automatically.
+The app bundle is created at:
 
-Find the Mac IP to enter on Windows:
-
-```bash
-ipconfig getifaddr en0
+```text
+dist/Portal.app
 ```
 
-### AWDL Permission and Startup Flow
+When Portal launches, grant Accessibility access if macOS asks for it.
 
-AWDL can interrupt low-latency Wi-Fi mouse movement. Portal can toggle AWDL from
-the Mac app, but macOS normally asks for an admin password each time. The app now
-uses a one-time permission flow:
+### 2. Build the Windows app
 
-- On first `Start`, Portal asks once for admin permission and installs a narrow
-  sudoers rule.
-- After that, `Start` disables AWDL without a password.
-- When Portal stops or quits, it enables AWDL again without a password.
-
-You can also install the same narrow sudoers rule manually:
-
-```bash
-./script/install_awdl_sudoers.sh
-```
-
-After that, the Mac app can run only these two commands without prompting:
-
-- `/sbin/ifconfig awdl0 down`
-- `/sbin/ifconfig awdl0 up`
-
-Remove the rule with:
-
-```bash
-./script/uninstall_awdl_sudoers.sh
-```
-
-## Build the Windows app
-
-On Windows, install the .NET 8 SDK, then run PowerShell from this folder:
+On Windows, from this repository:
 
 ```powershell
 .\windows\build-windows-exe.ps1
 ```
 
-The exe will be created at:
+The executable will be created at:
 
-`dist\windows\PortalWindows.exe`
+```text
+dist\windows\PortalWindows.exe
+```
 
-Open it, enter the Mac IP and port, then press `Start`.
+### 3. Connect Windows to the Mac
 
-For best capture behavior on Windows, run it as Administrator.
+- Open `Portal` on the Mac
+- Note the Mac IP and listener port
+- Open the Windows companion
+- Enter the Mac IP and port
+- Start the companion
 
-## Install the Windows app
+### 4. Use edge handoff
 
-After building the exe, create the installable package:
+Move the cursor to the configured edge on Windows to transfer control to the Mac. Move to the return edge on the Mac to switch back.
+
+## Windows installer flow
+
+Portal can serve the Windows installer directly from the Mac app.
+
+### Build the installer package on Windows
 
 ```powershell
 .\windows\package-windows-installer.ps1
 ```
 
-The package is created at:
+This creates:
 
-`dist\Portal-Windows-installer.zip`
+```text
+dist\Portal-Windows-installer.zip
+```
 
-Unzip it on Windows and run:
+### Install on Windows
+
+Unzip the package and run:
 
 ```powershell
 .\install-portal.ps1 -Launch
 ```
 
-This installs Portal to:
-
-`%LOCALAPPDATA%\Programs\Portal`
-
-It also creates Start Menu, Desktop, and startup shortcuts. To skip those:
+Optional flags:
 
 ```powershell
 .\install-portal.ps1 -NoDesktopShortcut -NoStartupShortcut
 ```
 
-## Remote Windows Build From Mac
+## Development
 
-To avoid copying the project back and forth, prepare the Windows machine once:
+### Run macOS tests
+
+```bash
+cd mac/PortalMac
+swift test
+```
+
+### Remote Windows build from the Mac
+
+Prepare the Windows machine once:
 
 ```powershell
 .\windows\setup-remote-build.ps1
 ```
 
-Then build from the Mac:
+Then from the Mac:
 
 ```bash
 ./script/build_windows_remote.sh user@windows-ip
 ```
 
-The Mac will copy the Windows project to the Windows machine, run the Windows build there, and fetch the exe back to:
-
-`dist/windows/PortalWindows.exe`
-
-For an even faster loop, leave this running once on the Windows desktop:
-
-```powershell
-.\windows\dev-watch-run.ps1
-```
-
-After that, every remote build from the Mac will update the exe under `PortalBuild` and the watcher will restart `PortalWindows.exe` automatically on the Windows desktop.
-
-Alternatively install the interactive restart task once:
-
-```powershell
-.\windows\install-restart-task.ps1
-```
-
-Then from the Mac you can restart the visible Windows app:
-
-```bash
-PORTAL_WIN_TARGET=user@windows-ip ./script/restart_windows_omerkunul.sh
-```
-
-Or build and restart in one step:
-
-```bash
-PORTAL_WIN_TARGET=user@windows-ip ./script/build_and_restart_windows_omerkunul.sh
-```
-
-You can also save the target:
+Or save the target:
 
 ```bash
 export PORTAL_WIN_TARGET=user@windows-ip
 ./script/build_windows_remote.sh
 ```
 
-## Controls
+Restart the visible Windows app:
 
-Use the wired mouse/keyboard on Windows. Move the cursor to the selected Windows screen edge to enter Mac control. Move the Mac cursor to the opposite edge to return to Windows.
+```bash
+PORTAL_WIN_TARGET=user@windows-ip ./script/restart_windows_omerkunul.sh
+```
 
-Emergency quit on Windows host:
+Build and restart together:
 
-`Ctrl + Alt + Backspace`
+```bash
+PORTAL_WIN_TARGET=user@windows-ip ./script/build_and_restart_windows_omerkunul.sh
+```
 
-## Performance Stats
+## Permissions and system behavior
 
-Both apps now show live stats:
+Portal relies on macOS Accessibility APIs to inject input on the Mac side.
 
-- Windows shows raw mouse samples per second and sent move packets.
-- Mac shows received move packets per second, raw samples per second, average/max packet interval, click count, key count and scroll count.
+The current prototype also includes an optional AWDL tuning flow to reduce Wi‑Fi latency side effects. That path is useful for local testing, but it is one of the reasons the current app is not suitable for Mac App Store distribution in its present form.
 
-Mouse movement defaults to immediate raw forwarding for lower latency. Stats stay throttled so the UI does not slow the pointer path.
+See:
 
-## Current MVP Limits
+- [docs/mac-app-store-readiness.md](docs/mac-app-store-readiness.md)
 
-- Windows edge detection uses the current Windows monitor. Mac movement is currently restored to the main Mac display while multi-monitor support is stabilized.
-- Basic keyboard mapping only, enough for letters, numbers, arrows, enter, escape, delete, tab, space, modifiers and common punctuation.
-- No encryption yet.
-- No clipboard or file transfer yet.
-- The Windows exe must be built on Windows because it targets `net8.0-windows`.
+## Limitations
+
+- This is not an encrypted transport yet
+- Multi-monitor behavior is still being refined
+- Keyboard mapping is intentionally narrow today
+- Clipboard and file transfer are not complete product features yet
+- The Windows executable must be built on Windows because it targets `net8.0-windows`
+
+## Open source plan
+
+Portal is being published as an open source project so the architecture, experiments, and cross-platform control model can evolve in the open.
+
+Near-term priorities:
+
+- cleaner onboarding
+- safer packaging
+- stronger transport security
+- better multi-display support
+- clearer distribution model for advanced macOS control features
+
+## Contributing
+
+Contributions are welcome.
+
+Start here:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## License
+
+This project is released under the MIT License.
+
+See:
+
+- [LICENSE](LICENSE)
