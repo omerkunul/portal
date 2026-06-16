@@ -1,34 +1,69 @@
 # Portal
 
-Portal is a LAN-based input handoff tool for people who work on a Windows machine and want to control a nearby Mac without reaching for a second keyboard and mouse.
+Portal is an open-source cross-platform input sharing tool that lets you control Windows and macOS computers with a single mouse and keyboard over the same local network.
 
-It is not remote desktop. Portal forwards input events over the local network and injects them on macOS so the Mac behaves like a directly connected machine.
+Portal is built for a very specific workflow: a Windows-first desk setup where a nearby Mac should feel like an extension of the same workspace, not a separate remote session.
 
-## What Portal does
+It is not remote desktop. It does not stream the Mac screen. Instead, it forwards input over LAN and hands control across screen edges.
 
-- Lets a Windows workstation drive a Mac over the same LAN
-- Uses edge-based cursor handoff instead of a modal remote session
-- Shows a native macOS control app for setup, pairing, status, and layout
-- Ships a Windows companion app and installer package
-- Includes fast local installer sharing from the Mac app
+![Portal UI preview](docs/assets/portal-ui-preview.png)
+
+## Why Portal exists
+
+Tools like Barrier, Input Leap, and Synergy proved that software KVM workflows are useful. Portal focuses on a narrower and more opinionated use case:
+
+- Windows to Mac handoff instead of broad every-to-every matrix setup
+- a native macOS control app instead of a config-first utility feel
+- built-in local installer sharing for the Windows companion
+- LAN-first setup and pairing flow
+- modern product UI rather than a legacy control panel style
+
+## What makes Portal different
+
+Portal is currently trying to optimize for:
+
+- simple setup for a single Windows + Mac desk
+- low-friction pairing on the same network
+- native macOS UX for status, onboarding, and layout
+- low-latency cursor and keyboard handoff
+- product-style packaging instead of only power-user configuration
 
 ## Current status
 
-Portal is an active experimental project.
+Portal is an experimental open-source project.
 
-Today it is best described as:
+Today it is:
 
-- a working local-network prototype
-- focused on macOS + Windows workflows
-- optimized for low-latency cursor and keyboard handoff
-- still evolving in packaging, security, and product polish
+- a working prototype
+- focused on local-network use
+- strongest on macOS-side product UX
+- still evolving in transport security, distribution, and multi-display behavior
 
-## How it works
+## Core idea
 
-1. The Mac app starts a local listener on your network.
-2. The Windows app connects to the Mac using its IP address and port.
-3. When your cursor reaches the configured screen edge on Windows, Portal switches control to the Mac.
-4. Moving back to the return edge hands control to Windows again.
+1. Run the macOS app on the Mac.
+2. Run the Windows companion on the Windows machine.
+3. Connect the Windows app to the Mac by IP and port.
+4. Move the cursor to the configured edge on Windows.
+5. Portal transfers control to the Mac.
+6. Move back to the return edge on the Mac to return to Windows.
+
+## Features
+
+### macOS app
+
+- Native SwiftUI desktop interface
+- Setup and status dashboard
+- Windows installer sharing over LAN
+- LAN scan for Windows candidates
+- Display arrangement preview
+- Accessibility onboarding
+
+### Windows companion
+
+- Connects to the Mac listener by IP and port
+- Sends mouse, keyboard, and scroll events
+- Can be packaged into an installable Windows bundle
 
 ## Repository layout
 
@@ -36,26 +71,9 @@ Today it is best described as:
 mac/PortalMac/          Swift macOS app
 windows/                Windows build, packaging, and install scripts
 script/                 Cross-machine build and helper scripts
-docs/                   Project notes and release audits
+docs/                   Project notes, assets, and audits
 dist/                   Local build output (ignored by git)
 ```
-
-## Features
-
-### macOS app
-
-- Native SwiftUI desktop interface
-- Live connection and activity status
-- Windows companion installer sharing
-- LAN scan flow for Windows candidates
-- Display arrangement preview
-- Accessibility permission onboarding
-
-### Windows companion
-
-- Connects to a Mac listener by IP and port
-- Sends mouse, keyboard, and scroll events
-- Supports packaging into an installable Windows bundle
 
 ## Requirements
 
@@ -68,10 +86,10 @@ dist/                   Local build output (ignored by git)
 ### Windows
 
 - Windows 10 or newer
-- .NET 8 SDK if you want to build from source
+- .NET 8 SDK if building from source
 - Same local network as the Mac
 
-## Quick start
+## Installation and usage
 
 ### 1. Build and run the Mac app
 
@@ -81,45 +99,47 @@ From the repository root:
 ./script/build_and_run.sh
 ```
 
-The app bundle is created at:
+This creates:
 
 ```text
 dist/Portal.app
 ```
 
-When Portal launches, grant Accessibility access if macOS asks for it.
+When the app launches, grant Accessibility access if macOS prompts for it.
 
-### 2. Build the Windows app
+### 2. Build the Windows companion
 
-On Windows, from this repository:
+On Windows:
 
 ```powershell
 .\windows\build-windows-exe.ps1
 ```
 
-The executable will be created at:
+This creates:
 
 ```text
 dist\windows\PortalWindows.exe
 ```
 
-### 3. Connect Windows to the Mac
+### 3. Connect the Windows machine to the Mac
 
 - Open `Portal` on the Mac
-- Note the Mac IP and listener port
+- Read the Mac IP and listener port from the app
 - Open the Windows companion
-- Enter the Mac IP and port
-- Start the companion
+- Enter the IP and port
+- Start the connection
 
-### 4. Use edge handoff
+### 4. Use handoff
 
-Move the cursor to the configured edge on Windows to transfer control to the Mac. Move to the return edge on the Mac to switch back.
+Move the cursor to the configured screen edge on Windows to switch to the Mac. Move to the return edge on the Mac to switch back.
 
-## Windows installer flow
+## Windows installer sharing
 
 Portal can serve the Windows installer directly from the Mac app.
 
-### Build the installer package on Windows
+### Build the Windows installer package
+
+On Windows:
 
 ```powershell
 .\windows\package-windows-installer.ps1
@@ -162,7 +182,7 @@ Prepare the Windows machine once:
 .\windows\setup-remote-build.ps1
 ```
 
-Then from the Mac:
+Then build remotely:
 
 ```bash
 ./script/build_windows_remote.sh user@windows-ip
@@ -187,35 +207,35 @@ Build and restart together:
 PORTAL_WIN_TARGET=user@windows-ip ./script/build_and_restart_windows_omerkunul.sh
 ```
 
-## Permissions and system behavior
+## Known limitations
 
-Portal relies on macOS Accessibility APIs to inject input on the Mac side.
-
-The current prototype also includes an optional AWDL tuning flow to reduce Wi‑Fi latency side effects. That path is useful for local testing, but it is one of the reasons the current app is not suitable for Mac App Store distribution in its present form.
-
-See:
-
-- [docs/mac-app-store-readiness.md](docs/mac-app-store-readiness.md)
-
-## Limitations
-
-- This is not an encrypted transport yet
+- Transport is not hardened yet
 - Multi-monitor behavior is still being refined
 - Keyboard mapping is intentionally narrow today
 - Clipboard and file transfer are not complete product features yet
 - The Windows executable must be built on Windows because it targets `net8.0-windows`
 
-## Open source plan
+## Distribution note
 
-Portal is being published as an open source project so the architecture, experiments, and cross-platform control model can evolve in the open.
+The current macOS prototype relies on Accessibility and low-level input behavior. That makes it a poor fit for the Mac App Store in its current form.
 
-Near-term priorities:
+See:
 
-- cleaner onboarding
+- [docs/mac-app-store-readiness.md](docs/mac-app-store-readiness.md)
+
+## Roadmap
+
+See:
+
+- [ROADMAP.md](ROADMAP.md)
+
+Near-term themes:
+
+- onboarding polish
 - safer packaging
 - stronger transport security
-- better multi-display support
-- clearer distribution model for advanced macOS control features
+- better multi-display behavior
+- clearer distribution strategy for advanced macOS control features
 
 ## Contributing
 
@@ -227,7 +247,7 @@ Start here:
 
 ## License
 
-This project is released under the MIT License.
+Portal is released under the MIT License.
 
 See:
 
